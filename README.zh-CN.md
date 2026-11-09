@@ -165,12 +165,12 @@ project_fact。
 | `store` | 写入五字段记忆或校验导入会话 |
 | `recall` | 在单个项目内召回，支持解释、深层、有效期、取代关系和显式强化 |
 | `update ID` | 修订正文并保留项目和真实使用元数据 |
-| `history ID` | 查看当前记录和历史快照 |
+| `history ID --project-key ...` | 在项目作用域内查看当前记录和历史快照 |
 | `list` | 查看活跃、归档或全部记忆 |
 | `protect` / `unprotect` | 按具体 ID 与理由保护或恢复衰减 |
 | `archive` / `restore` | 切换状态并保留原 ID |
 | `review` | 只读列出重复、冲突和混合项目线索 |
-| `link` / `relations` | 记录和查看 `supersedes` / `derived_from` 证据 |
+| `link` / `relations --project-key ...` | 在项目作用域内记录和查看 `supersedes` / `derived_from` 证据 |
 | `decay` | 预览或应用经过时长的衰减与低权重归档 |
 | `dream` | 生成手动合并候选，不自动修改正文 |
 | `reindex` | 重建 jieba 检索词和 FTS5 索引 |

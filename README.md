@@ -170,12 +170,12 @@ slowly than experiences and project facts.
 | `store` | Add a five-field memory or validate an imported conversation |
 | `recall` | Search one project; supports `--explain`, `--deep`, validity, supersession, and explicit reinforcement |
 | `update ID` | Revise text while preserving project and usage metadata |
-| `history ID` | Inspect the current row and prior snapshots |
+| `history ID --project-key ...` | Inspect the current row and prior snapshots inside one project scope |
 | `list` | Inspect active, archived, or all memories |
 | `protect` / `unprotect` | Exempt or resume decay by explicit ID and reason |
 | `archive` / `restore` | Transition memory status without changing its ID |
 | `review` | Read-only duplicate, conflict, and mixed-project clues |
-| `link` / `relations` | Record and inspect `supersedes` or `derived_from` evidence |
+| `link` / `relations --project-key ...` | Record and inspect `supersedes` or `derived_from` evidence within one project scope |
 | `decay` | Preview or apply elapsed-time decay and threshold archival |
 | `dream` | Produce manual merge candidates; never edits automatically |
 | `reindex` | Rebuild jieba tokens and the FTS5 index |

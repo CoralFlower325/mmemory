@@ -1254,14 +1254,22 @@ def purge_memory(memory_id: int, reason: str, *,
             sp_open = False
             if own_tx:
                 conn.commit()
-                conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-                conn.execute('VACUUM')
-                conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            cleanup_error = ''
+            if own_conn:
+                try:
+                    conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                    conn.execute('VACUUM')
+                    conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                except sqlite3.Error as exc:
+                    cleanup_error = str(exc)
             return {**result, 'purged': True,
-                    'physical_cleanup': bool(own_conn),
-                    'reason': ('记忆正文、关系与修订快照已删除并压缩数据库'
-                               if own_conn else
-                               '记忆已逻辑删除；调用方事务提交后需自行 VACUUM')}
+                    'physical_cleanup': bool(own_conn) and not cleanup_error,
+                    'reason': (
+                        '记忆正文、关系与修订快照已删除并压缩数据库'
+                        if own_conn and not cleanup_error else
+                        f'记忆已逻辑删除，但物理压缩失败：{cleanup_error}'
+                        if own_conn else
+                        '记忆已逻辑删除；调用方事务提交后需自行 VACUUM')}
         except Exception:
             if sp_open:
                 conn.execute('ROLLBACK TO mm_purge')
