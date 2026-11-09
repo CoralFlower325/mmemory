@@ -126,7 +126,7 @@ def validate_fields(goal: str, approach: str, outcome: str,
     # 空字段校验：goal/approach/outcome 不能为空
     empty_fields = [name for name, val in
                     [('goal', goal), ('approach', approach), ('outcome', outcome)]
-                    if not val or not val.strip()]
+                    if not isinstance(val, str) or is_blank(val)]
     if empty_fields:
         return False, f'必填字段为空: {", ".join(empty_fields)}', cleaned
 

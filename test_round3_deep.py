@@ -357,13 +357,15 @@ conn_tx = engine.get_conn(tmp_db)
 r1 = engine.store("tx_test_goal", "tx_approach", "tx_outcome", db_conn=conn_tx)
 test("事务: 首次 store 成功", "P0", r1['stored'] is True, f"id={r1['memory_id']}")
 
-# 10b: store 重复 → reinforce
+# 10b: store 重复 → 去重提示，但不伪造真实使用
 r2 = engine.store("tx_test_goal", "tx_approach", "tx_outcome", db_conn=conn_tx)
-test("事务: 重复 store 触发 reinforce", "P0", not r2['stored'] and '重复' in r2['reason'])
+test("事务: 重复 store 去重但不强化", "P0",
+     not r2['stored'] and '重复' in r2['reason'] and '未强化' in r2['reason'])
 
-# 10c: 强化效果已 commit (因为 store 自带 commit)
+# 10c: 使用次数保持 0，只有显式 recall --reinforce 才改变真实使用元数据
 row = conn_tx.execute("SELECT use_count FROM memories WHERE id=?", (r1['memory_id'],)).fetchone()
-test("事务: store dedup 后强化已持久化", "P0", row['use_count'] >= 1, f"use_count={row['use_count']}")
+test("事务: store dedup 后不伪造使用", "P0", row['use_count'] == 0,
+     f"use_count={row['use_count']}")
 
 conn_tx.close()
 

@@ -85,13 +85,27 @@ class AuditRegressions(unittest.TestCase):
 
     def old_database(self):
         db = Path(self.directory.name) / 'old.db'
-        # 明确构造新增生命周期列之前的 schema，避免依赖当前末列位置。
-        schema = Path('schema.sql').read_text()
-        schema = '\n'.join(line for line in schema.splitlines()
-                           if not line.strip().startswith(('decay_cursor_at ', 'archived_at ', 'archive_reason ',
-                                                           'protected ', 'protection_reason ')))
-        schema = re.sub(r'CREATE TABLE IF NOT EXISTS memory_relations \([\s\S]*?\n\);', '', schema)
-        schema = schema.replace("project_key   TEXT NOT NULL DEFAULT '',", "project_key   TEXT NOT NULL DEFAULT ''")
+        # 固定最小旧 schema，避免测试依赖当前 schema.sql 的追加列位置。
+        schema = """
+        CREATE TABLE memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            goal TEXT NOT NULL,
+            approach TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            success_key TEXT DEFAULT '',
+            pitfall TEXT DEFAULT '',
+            tags_tool TEXT DEFAULT 'general',
+            tags_domain TEXT DEFAULT 'general',
+            tags_action TEXT DEFAULT 'general',
+            tags_keywords TEXT DEFAULT '',
+            weight REAL DEFAULT 1.0,
+            use_count INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now', 'localtime')),
+            last_used TEXT DEFAULT (datetime('now', 'localtime')),
+            status TEXT DEFAULT 'active',
+            project_key TEXT NOT NULL DEFAULT ''
+        );
+        """
         with sqlite3.connect(db) as c:
             c.executescript(schema)
             c.execute("INSERT INTO memories(goal,approach,outcome,weight,last_used) VALUES('历史记录','步骤','结果',.41,'2025-01-01')")

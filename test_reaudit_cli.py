@@ -164,8 +164,9 @@ class CliReaudit(unittest.TestCase):
         self.assertEqual(applied.returncode, 0, applied.stderr)
         self.assertEqual(json.loads(applied.stdout), {'decayed': 0, 'archived': 1})
         self.assertEqual(self.row(101)['status'], 'archived')
-        for field in (*engine.CONTENT_FIELDS, 'id', 'weight', 'last_used', 'use_count'):
+        for field in (*engine.CONTENT_FIELDS, 'id', 'last_used', 'use_count'):
             self.assertEqual(before[0][field], self.row(101)[field], field)
+        self.assertLess(self.row(101)['weight'], before[0]['weight'])
         self.assertEqual(len(self.rows()), 3)
         help_text = self.cli('decay', '--help')
         self.assertEqual(help_text.returncode, 0)

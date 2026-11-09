@@ -3,6 +3,7 @@
 
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
+PRAGMA user_version=2;
 
 -- 主记忆表
 -- project_key 和 decay_cursor_at 按旧库 ALTER TABLE 的追加顺序排列。
@@ -37,7 +38,18 @@ CREATE TABLE IF NOT EXISTS memories (
     archive_reason TEXT DEFAULT '',
     -- 显式保护避免自动维护；人工指定 ID 的归档仍然允许。
     protected     INTEGER NOT NULL DEFAULT 0,
-    protection_reason TEXT DEFAULT ''
+    protection_reason TEXT DEFAULT '',
+
+    -- v2 元数据。全部追加在旧列之后，兼容旧库迁移。
+    revision      INTEGER NOT NULL DEFAULT 1,
+    kind          TEXT NOT NULL DEFAULT 'experience',
+    source_ref    TEXT NOT NULL DEFAULT '',
+    origin        TEXT NOT NULL DEFAULT '',
+    verification  TEXT NOT NULL DEFAULT 'unverified',
+    valid_from    TEXT NOT NULL DEFAULT '',
+    valid_until   TEXT NOT NULL DEFAULT '',
+    -- 由 jieba 与规范化文本生成，供 FTS5 使用。
+    search_text   TEXT NOT NULL DEFAULT ''
 );
 
 -- 显式引用：source supersedes/derived_from target；记录关系不改变记忆状态。
@@ -50,32 +62,44 @@ CREATE TABLE IF NOT EXISTS memory_relations (
     PRIMARY KEY (source_id, target_id, relation)
 );
 
--- 全文检索（兜底召回）
+-- 修订快照：每次 update 或维护性改写前保存旧正文。
+CREATE TABLE IF NOT EXISTS memory_revisions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id     INTEGER NOT NULL REFERENCES memories(id),
+    revision      INTEGER NOT NULL,
+    snapshot      TEXT NOT NULL,
+    reason        TEXT NOT NULL,
+    created_at    TEXT DEFAULT (datetime('now', 'localtime')),
+    UNIQUE(memory_id, revision)
+);
+
+-- 预分词全文检索；中文正文由 jieba 写入 search_text。
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-    goal, approach, outcome, success_key, pitfall, tags_keywords,
+    search_text,
     content='memories',
     content_rowid='id'
 );
 
 -- FTS 同步触发器
 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-    INSERT INTO memories_fts(rowid, goal, approach, outcome, success_key, pitfall, tags_keywords)
-    VALUES (new.id, new.goal, new.approach, new.outcome, new.success_key, new.pitfall, new.tags_keywords);
+    INSERT INTO memories_fts(rowid, search_text)
+    VALUES (new.id, new.search_text);
 END;
 
 CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, goal, approach, outcome, success_key, pitfall, tags_keywords)
-    VALUES ('delete', old.id, old.goal, old.approach, old.outcome, old.success_key, old.pitfall, old.tags_keywords);
+    INSERT INTO memories_fts(memories_fts, rowid, search_text)
+    VALUES ('delete', old.id, old.search_text);
 END;
 
 CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, goal, approach, outcome, success_key, pitfall, tags_keywords)
-    VALUES ('delete', old.id, old.goal, old.approach, old.outcome, old.success_key, old.pitfall, old.tags_keywords);
-    INSERT INTO memories_fts(rowid, goal, approach, outcome, success_key, pitfall, tags_keywords)
-    VALUES (new.id, new.goal, new.approach, new.outcome, new.success_key, new.pitfall, new.tags_keywords);
+    INSERT INTO memories_fts(memories_fts, rowid, search_text)
+    VALUES ('delete', old.id, old.search_text);
+    INSERT INTO memories_fts(rowid, search_text)
+    VALUES (new.id, new.search_text);
 END;
 
--- 查询索引：唯一的过滤维度是 status 与 project_key。工作集仅几十行，这两个
--- 索引收益有限但成本极低，保留以与线上库结构一致（线上库存在这两个索引）。
 CREATE INDEX IF NOT EXISTS idx_mem_status ON memories(status);
 CREATE INDEX IF NOT EXISTS idx_mem_project_status ON memories(project_key, status);
+CREATE INDEX IF NOT EXISTS idx_mem_kind ON memories(kind);
+CREATE INDEX IF NOT EXISTS idx_mem_valid_until ON memories(valid_until);
+CREATE INDEX IF NOT EXISTS idx_revision_memory ON memory_revisions(memory_id, revision);

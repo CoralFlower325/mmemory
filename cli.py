@@ -54,6 +54,12 @@ def cmd_store(args):
         success_key=args.success_key or '',
         pitfall=args.pitfall or '',
         project_key=args.project_key,
+        kind=args.memory_kind or 'experience',
+        source_ref=args.source_ref,
+        origin=args.origin,
+        verification=args.verification,
+        valid_from=args.valid_from,
+        valid_until=args.valid_until,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if not result['stored']:
@@ -66,7 +72,10 @@ def cmd_recall(args):
     # 被采用时才显式传 --reinforce。
     result = engine.recall_with_explain(args.message, limit=args.limit,
                              reinforce=args.reinforce,
-                             project_key=args.project_key)
+                             project_key=args.project_key,
+                             deep=args.deep,
+                             include_superseded=args.include_superseded,
+                             include_expired=args.include_expired)
     memories = result['memories']
     if args.explain:
         print(json.dumps(result['explanation'], ensure_ascii=False, indent=2))
@@ -79,7 +88,15 @@ def cmd_recall(args):
 def cmd_update(args):
     result = engine.update_memory(args.memory_id, goal=args.goal, approach=args.approach,
                                   outcome=args.outcome, success_key=args.success_key,
-                                  pitfall=args.pitfall, project_key=args.project_key)
+                                  pitfall=args.pitfall,
+                                  kind=args.memory_kind,
+                                  source_ref=args.source_ref,
+                                  origin=args.origin,
+                                  verification=args.verification,
+                                  valid_from=args.valid_from,
+                                  valid_until=args.valid_until,
+                                  reason=args.reason,
+                                  project_key=args.project_key)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if not result['updated']:
         sys.exit(1)
@@ -126,6 +143,25 @@ def cmd_relations(args):
     print(json.dumps(engine.list_relations(args.memory_id), ensure_ascii=False, indent=2))
 
 
+def cmd_history(args):
+    print(json.dumps(engine.list_history(args.memory_id), ensure_ascii=False, indent=2))
+
+
+def cmd_purge(args):
+    if not args.yes:
+        print(json.dumps({
+            'purged': False,
+            'memory_id': args.memory_id,
+            'reason': '硬删除不可恢复；确认后加 --yes',
+        }, ensure_ascii=False, indent=2))
+        sys.exit(1)
+    result = engine.purge_memory(
+        args.memory_id, args.reason, project_key=args.project_key)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if not result['purged']:
+        sys.exit(1)
+
+
 def cmd_review(args):
     try:
         result = review.review_candidates(project_key=args.project_key,
@@ -155,6 +191,12 @@ def cmd_list(args):
         print(f"   创建时间：{m.get('created_at') or ''}")
         print(f"   最后使用：{m.get('last_used') or ''}")
         print(f"   衰减游标：{m.get('decay_cursor_at') or ''}")
+        print(f"   类型：{m.get('kind') or 'experience'}")
+        print(f"   验证状态：{m.get('verification') or 'unverified'}")
+        print(f"   来源标识：{m.get('source_ref') or ''}")
+        print(f"   来源说明：{m.get('origin') or ''}")
+        print(f"   有效区间：{m.get('valid_from') or '不限'} -> {m.get('valid_until') or '不限'}")
+        print(f"   修订号：{m.get('revision') or 1}")
         if m.get('protected'):
             print(f"   保护原因：{m.get('protection_reason') or ''}")
         if m['status'] == 'archived':
@@ -166,6 +208,10 @@ def cmd_list(args):
 def cmd_stats(args):
     stats = engine.get_stats(project_key=args.project_key)
     print(json.dumps(stats, ensure_ascii=False, indent=2))
+
+
+def cmd_reindex(args):
+    print(json.dumps(engine.rebuild_search_index(), ensure_ascii=False, indent=2))
 
 
 def cmd_decay(args):
@@ -235,8 +281,15 @@ def main():
     p.add_argument('--project-key', default=None,
                    help='项目命名空间；省略时按高信号项目名推断')
     p.add_argument('--conversation', help='真实消息 JSON 列表或 {"messages": [...]}；启用会话质量过滤')
-    p.add_argument('--memory-kind', choices=['experience', 'project_fact', 'preference'], default=None)
+    p.add_argument('--memory-kind', '--kind', dest='memory_kind',
+                   choices=['experience', 'project_fact', 'preference'], default=None)
     p.add_argument('--task-state', choices=['completed', 'in_progress', 'cancelled'], default=None)
+    p.add_argument('--source-ref', default='', help='稳定来源标识，如文件、URL 或记忆 ID')
+    p.add_argument('--origin', default='', help='来源类型或宿主说明')
+    p.add_argument('--verification', default='unverified',
+                   choices=['unverified', 'verified', 'disputed'])
+    p.add_argument('--valid-from', default='', help='ISO-8601 生效时间')
+    p.add_argument('--valid-until', default='', help='ISO-8601 失效时间')
 
     # recall
     p = sub.add_parser('recall', help='召回记忆')
@@ -244,6 +297,11 @@ def main():
     p.add_argument('--limit', type=int, default=5)
     p.add_argument('--reinforce', action='store_true', help='显式使用后强化命中记忆')
     p.add_argument('--explain', action='store_true', help='解释项目、查询词、候选来源和排序')
+    p.add_argument('--deep', action='store_true', help='活跃命中不足时包含归档线索')
+    p.add_argument('--include-superseded', action='store_true',
+                   help='显示已被 supersedes 关系取代的旧记录并标注')
+    p.add_argument('--include-expired', action='store_true',
+                   help='显示过了 valid_until 的历史记录并标注')
     p.add_argument('--project-key', default=None,
                    help='项目命名空间；省略时按查询文本推断')
 
@@ -251,6 +309,15 @@ def main():
     p.add_argument('memory_id', type=int)
     for field in ('goal', 'approach', 'outcome', 'success-key', 'pitfall'):
         p.add_argument('--' + field, default=None)
+    p.add_argument('--memory-kind', '--kind', dest='memory_kind', default=None,
+                   choices=['experience', 'project_fact', 'preference'])
+    p.add_argument('--source-ref', default=None)
+    p.add_argument('--origin', default=None)
+    p.add_argument('--verification', default=None,
+                   choices=['unverified', 'verified', 'disputed'])
+    p.add_argument('--valid-from', default=None)
+    p.add_argument('--valid-until', default=None)
+    p.add_argument('--reason', default='手动修订')
     p.add_argument('--project-key', default=None, help='仅允许更新此项目中的 ID')
 
     p = sub.add_parser('backup', help='生成一致性 SQLite 备份，不覆盖已有文件')
@@ -282,6 +349,15 @@ def main():
     p = sub.add_parser('relations', help='查看某个实际 ID 的双向引用关系')
     p.add_argument('memory_id', type=int)
 
+    p = sub.add_parser('history', help='查看某个实际 ID 的当前记录和修订快照')
+    p.add_argument('memory_id', type=int)
+
+    p = sub.add_parser('purge', help='不可恢复地删除正文、关系和修订快照')
+    p.add_argument('memory_id', type=int)
+    p.add_argument('--reason', required=True)
+    p.add_argument('--project-key', default=None, help='限定实际 ID 的项目')
+    p.add_argument('--yes', action='store_true', help='确认不可恢复删除')
+
     for command in ('protect', 'unprotect'):
         p = sub.add_parser(command, help='保护重要记录免于自动维护' if command == 'protect' else '解除保护，从当前时刻重新计入衰减')
         p.add_argument('memory_ids', type=int, nargs='+')
@@ -299,6 +375,8 @@ def main():
     # stats
     p = sub.add_parser('stats', help='统计信息')
     p.add_argument('--project-key', default=None)
+
+    p = sub.add_parser('reindex', help='重建中文检索索引与关键词列')
 
     # decay
     p = sub.add_parser('decay', help='权重衰减（默认预览；--apply 执行可恢复归档）',
@@ -334,12 +412,14 @@ def main():
 
     cmds = {
         'store': cmd_store, 'recall': cmd_recall, 'list': cmd_list,
-        'stats': cmd_stats, 'decay': cmd_decay, 'dream': cmd_dream,
+        'stats': cmd_stats, 'reindex': cmd_reindex,
+        'decay': cmd_decay, 'dream': cmd_dream,
         'tag': cmd_tag, 'filter': cmd_filter,
         'update': cmd_update, 'backup': cmd_backup,
         'archive': cmd_archive, 'restore': cmd_restore,
         'protect': cmd_protect, 'unprotect': cmd_protect,
         'link': cmd_link, 'relations': cmd_relations, 'review': cmd_review,
+        'history': cmd_history, 'purge': cmd_purge,
     }
     cmds[args.command](args)
 
