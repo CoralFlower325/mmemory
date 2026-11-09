@@ -1,0 +1,22 @@
+.DS_Store
+.env
+.env.*
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Private runtime data and local maintenance artifacts
+*.db*
+backups/
+_legacy/
+.work/
+obsidian-export/
+projects.json
+
+# Installed-host integration tests stay with the local deployment
+test_adversarial_fixes_20261020.py
+test_optimization_hermes.py
+test_reaudit_hermes.py

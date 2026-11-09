@@ -1,0 +1,8 @@
+{
+  "projects": {
+    "my-project": {
+      "write_aliases": ["my-project", "project codename"],
+      "query_aliases": ["my-project", "project topic"]
+    }
+  }
+}

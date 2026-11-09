@@ -1,0 +1,349 @@
+"""
+Tag 生成系统：三层
+  第一层：固定维度（tool/domain/action），规则匹配
+  第二层：动态关键词，jieba TF-IDF
+  第三层：同义词归一化
+"""
+
+import json
+import os
+import re
+from pathlib import Path
+from typing import Optional
+
+# ── 第一层：规则库 ──────────────────────────────────────────────
+
+TOOL_PATTERNS: dict[str, str] = {
+    # 注意：python 的 pattern 不能包含裸的 `import `——它在字典里排第一，会把
+    # `import pandas` / `import torch` 这类具体库全部抢先判成 python，令后面
+    # 所有库的 pattern 失效。具体库各自由自己的 pattern 命中。
+    'python':     r'python|\.py\b',
+    'selenium':   r'selenium|webdriver|chromedriver|undetected',
+    'playwright': r'playwright',
+    'requests':   r'import requests|requests\.(get|post|put|delete)',
+    'httpx':      r'import httpx|httpx\.',
+    'pandas':     r'import pandas|pd\.|DataFrame|read_csv|read_excel',
+    'numpy':      r'import numpy|np\.',
+    'matplotlib': r'import matplotlib|plt\.',
+    'flask':      r'from flask|import flask|Flask\(__name__\)',
+    'fastapi':    r'from fastapi|import fastapi|FastAPI\(\)',
+    'sqlalchemy': r'from sqlalchemy|create_engine',
+    'redis':      r'import redis|redis\.Redis',
+    'celery':     r'from celery|Celery\(',
+    'docker':     r'docker (build|run|compose)|Dockerfile|docker-compose',
+    'git':        r'git (commit|push|pull|merge|rebase|checkout|clone)',
+    'ffmpeg':     r'ffmpeg|ffprobe',
+    'pytest':     r'import pytest|pytest\.|def test_',
+    'jieba':      r'import jieba|jieba\.',
+    'pydantic':   r'from pydantic|BaseModel',
+    'nginx':      r'nginx|proxy_pass',
+    'latex':      r'\\documentclass|\\begin\{document\}|xelatex|pdflatex',
+    'fpga':       r'Verilog|VHDL|vivado|quartus|FPGA',
+    'sqlite':     r'sqlite3?\.connect|import sqlite3',
+    'mysql':      r'pymysql|mysql\.connector|MySQLdb',
+    'postgres':   r'psycopg2|asyncpg|postgresql',
+    'hermes':     r'hermes|Hermes Agent',
+    'onnx':       r'onnx|onnxruntime',
+    'torch':      r'import torch|PyTorch|torch\.nn',
+    'transformers': r'from transformers|AutoModel|AutoTokenizer',
+}
+
+DOMAIN_KEYWORDS: dict[str, list[str]] = {
+    'web-scraping':    ['爬虫','抓取','scrape','crawl','反爬','动态渲染','爬取','spider'],
+    'data-processing': ['数据处理','清洗','ETL','csv','excel','数据分析','合并','数据集'],
+    'automation':      ['自动化','脚本','批处理','定时','cron','workflow','流水线'],
+    'doc-writing':     ['论文','报告','LaTeX','排版','文档','写作','word','docx','PPT'],
+    'math-modeling':   ['数学建模','优化','算法','概率','统计','MATLAB','运筹'],
+    'electronics':     ['电路','PCB','信号','示波器','频谱','模电','数电','焊接'],
+    'ml':              ['训练','模型','推理','loss','epoch','微调','finetune'],
+    'devops':          ['部署','CI/CD','docker','nginx','服务器','运维','监控'],
+    'fpga':            ['FPGA','Verilog','VHDL','时序','综合','仿真','约束','约束文件'],
+    'web-dev':         ['前端','后端','API','接口','页面','路由','组件','React','Vue'],
+    'linux':           ['Linux','shell','bash','系统','内核','权限','systemd'],
+    'memory-system':   ['记忆系统','记忆','recall','retain','memory','Hindsight','mmemory'],
+    'music-curation':  ['Apple Music','My Playlist','歌单','播放列表','曲目','歌曲核验','playlist'],
+}
+
+# 项目/场景词优先于通用词，避免“论文”“数据”“模型”等宽泛词抢占领域。
+PRIORITY_DOMAIN_KEYWORDS: dict[str, list[str]] = {
+    'exam-learning':      ['考试复习', '错题本', '学习计划', '学习目标'],
+    'research':           ['文献综述', '论文调研', '研究计划'],
+    'game-development':   ['游戏开发', '游戏设计', '关卡设计', '游戏'],
+    'fiction-writing':    ['小说写作', '长篇写作', '章节写作'],
+    'education-planning': ['升学规划', '择校', '复习计划'],
+    'math-modeling':      ['数学建模竞赛', '数学建模', '建模竞赛'],
+}
+
+# 记忆属于哪个项目不是领域标签的同义词。默认只放通用示例，真实项目名应写入
+# 本地忽略文件 projects.json，或用 MMEMORY_PROJECTS_FILE 指向另一份配置。
+DEFAULT_PROJECT_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ('mmemory', ('mmemory', 'hindsight', '记忆系统')),
+    ('example-service', ('example-service', 'example service')),
+    ('example-piano', ('example-piano', 'example piano')),
+)
+
+DEFAULT_QUERY_PROJECT_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = ()
+
+
+def _project_config_path() -> Optional[Path]:
+    configured = os.environ.get('MMEMORY_PROJECTS_FILE')
+    if configured:
+        return Path(configured).expanduser()
+    local = Path(__file__).with_name('projects.json')
+    return local if local.exists() else None
+
+
+def _alias_tuple(value, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f'{label} 必须是非空字符串数组')
+    aliases = []
+    for alias in value:
+        if not isinstance(alias, str) or not alias.strip():
+            raise ValueError(f'{label} 必须是非空字符串数组')
+        aliases.append(alias.strip())
+    return tuple(aliases)
+
+
+def load_project_config(path: Optional[Path] = None) -> tuple[
+        tuple[tuple[str, tuple[str, ...]], ...],
+        tuple[tuple[str, tuple[str, ...]], ...]]:
+    """加载项目别名配置，并返回写入与查询两份有序词表。
+
+    配置格式：
+    ``{"projects": {"key": ["alias", ...]}}``
+
+    每项也可写成
+    ``{"write_aliases": [...], "query_aliases": [...]}``。未提供配置文件时
+    使用内置通用示例；配置文件与默认表同名键会覆盖默认值，其他键追加。
+    """
+    write_order = [key for key, _ in DEFAULT_PROJECT_KEYWORDS]
+    write_map = {key: aliases for key, aliases in DEFAULT_PROJECT_KEYWORDS}
+    query_order = [key for key, _ in DEFAULT_QUERY_PROJECT_KEYWORDS]
+    query_map = {key: aliases for key, aliases in DEFAULT_QUERY_PROJECT_KEYWORDS}
+
+    if path is None:
+        path = _project_config_path()
+    if path is not None:
+        path = Path(path).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f'项目配置不存在：{path}')
+        data = json.loads(path.read_text(encoding='utf-8'))
+        projects = data.get('projects') if isinstance(data, dict) else None
+        if not isinstance(projects, dict):
+            raise ValueError('项目配置必须包含 projects 对象')
+        for project, spec in projects.items():
+            if not isinstance(project, str) or not project.strip():
+                raise ValueError('项目键必须是非空字符串')
+            project = project.strip()
+            if isinstance(spec, list):
+                write_aliases = _alias_tuple(spec, f'{project}.aliases')
+                query_aliases = write_aliases
+            elif isinstance(spec, dict):
+                write_aliases = _alias_tuple(
+                    spec.get('write_aliases'), f'{project}.write_aliases')
+                query_aliases = _alias_tuple(
+                    spec.get('query_aliases', list(write_aliases)),
+                    f'{project}.query_aliases')
+            else:
+                raise ValueError(f'{project} 的别名配置必须是数组或对象')
+
+            if project not in write_map:
+                write_order.append(project)
+            write_map[project] = write_aliases
+            if project not in query_map:
+                query_order.append(project)
+            query_map[project] = query_aliases
+
+    _reject_duplicate_aliases(write_map, '写入')
+    return (
+        tuple((key, write_map[key]) for key in write_order),
+        tuple((key, query_map[key]) for key in query_order),
+    )
+
+
+def _reject_duplicate_aliases(project_map: dict[str, tuple[str, ...]],
+                              kind: str):
+    seen = {}
+    for project, aliases in project_map.items():
+        for alias in aliases:
+            folded = alias.casefold()
+            owner = seen.get(folded)
+            if owner is not None and owner != project:
+                raise ValueError(
+                    f'{kind}别名 {alias!r} 同时属于 {owner} 和 {project}')
+            seen[folded] = project
+
+
+PROJECT_KEYWORDS, QUERY_PROJECT_KEYWORDS = load_project_config()
+
+
+def _alias_in_text(alias: str, text: str) -> bool:
+    lowered = (text or '').lower()
+    alias = alias.lower()
+    if alias.isascii() and alias.isalnum():
+        return re.search(rf'(?<![a-z0-9_]){re.escape(alias)}(?![a-z0-9_])', lowered) is not None
+    return alias in lowered
+
+
+def project_keys_in_text(text: str) -> list[str]:
+    """返回文本中所有明确的现有项目键，保持词表顺序并去重。"""
+    return [project for project, keywords in PROJECT_KEYWORDS
+            if any(_alias_in_text(keyword, text) for keyword in keywords)]
+
+
+def infer_query_project_keys(text: str) -> list[str]:
+    """为召回解析查询范围；精确项目优先，未见精确名时才用宽泛主题词。
+
+    这个函数不用于写入归属。查询允许“深度学习”同时搜索实验一和实验二，
+    但“使用 MATLAB 训练模型”不会因此改变新记忆的 project_key。
+    """
+    exact = project_keys_in_text(text)
+    if exact:
+        return exact
+    matched = {project for project, keywords in QUERY_PROJECT_KEYWORDS
+               if any(_alias_in_text(keyword, text) for keyword in keywords)}
+    order = [project for project, _ in PROJECT_KEYWORDS]
+    return [project for project in order if project in matched]
+
+
+def infer_project_key(text: str) -> str:
+    """从高信号项目名推断命名空间；不确定时返回 ``''``。
+
+    多个项目词同时出现时保持配置顺序，由调用方在写入前检查歧义。
+    """
+    for project, keywords in PROJECT_KEYWORDS:
+        if any(_alias_in_text(keyword, text) for keyword in keywords):
+            return project
+    return ''
+
+ACTION_KEYWORDS: dict[str, list[str]] = {
+    'debug':     ['bug','报错','error','失败','异常','排查','调试','出错','崩溃','traceback','修复'],
+    'build':     ['搭建','构建','安装','配置','初始化','setup','新建','创建','install','完成','产出','交付'],
+    'migrate':   ['迁移','升级','替换','切换','迁到','改成','换用','重构'],
+    'deploy':    ['部署','上线','发布','docker','CI/CD','release'],
+    'optimize':  ['优化','加速','减少','降低','提升','压缩','改进','性能','精修','重写'],
+    'integrate': ['集成','对接','接入','API','联调','整合','桥接'],
+    'extract':   ['提取','抽取','解析','导出','转换'],
+    'design':    ['设计','方案','架构','规划','选型','评估'],
+    'test':      ['测试','验证','检查','校验','benchmark','压测','审查','审阅','复核'],
+    'manage':    ['整改','管理','编辑','替换','保留','删除','调整','核验','拉回'],
+}
+
+
+# ── 第一层：固定维度提取 ────────────────────────────────────────
+
+def extract_fixed_tags(text: str) -> dict[str, str]:
+    """从文本中提取 tool/domain/action 三个固定维度"""
+
+    # tool
+    tool = 'general'
+    for name, pat in TOOL_PATTERNS.items():
+        if re.search(pat, text, re.IGNORECASE):
+            tool = name
+            break
+
+    # domain
+    domain = 'general'
+    lowered = text.lower()
+    for d, keywords in PRIORITY_DOMAIN_KEYWORDS.items():
+        if any(kw.lower() in lowered for kw in keywords):
+            domain = d
+            break
+    if domain == 'general':
+        # 统一小写比较：词表里写的是 MATLAB / Linux / ETL 这类大写词，裸 `in`
+        # 会让 "matlab" 这种小写写法漏掉匹配。
+        for d, keywords in DOMAIN_KEYWORDS.items():
+            if any(kw.lower() in lowered for kw in keywords):
+                domain = d
+                break
+
+    # action
+    action = 'general'
+    for a, keywords in ACTION_KEYWORDS.items():
+        if any(kw.lower() in lowered for kw in keywords):
+            action = a
+            break
+
+    return {'tool': tool, 'domain': domain, 'action': action}
+
+
+# ── 第二层：动态关键词 ──────────────────────────────────────────
+
+def extract_keywords(text: str, topk: int = 5) -> list[str]:
+    """jieba TF-IDF 提取关键词"""
+    try:
+        import jieba.analyse
+        return jieba.analyse.extract_tags(
+            text, topK=topk,
+            allowPOS=('n', 'nr', 'ns', 'nt', 'nz', 'vn', 'eng')
+        )
+    except ImportError:
+        tokens = fallback_tokenize(text)
+        tokens.sort(key=len, reverse=True)
+        return tokens[:topk]
+
+
+# ── 公共分词回退（jieba 不可用时） ──────────────────────────────
+
+def fallback_tokenize(text: str) -> list[str]:
+    """jieba 不可用时的回退分词：按 Unicode 范围切分中文/英文词"""
+    return re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z][a-zA-Z0-9_]+', text)
+
+
+# ── 第三层：同义词归一化 ─────────────────────────────────────────
+
+def load_synonym_map() -> dict[str, str]:
+    """返回内置同义词映射。
+
+    以前这里还会读数据库的 synonyms 表，但 Dream 补全出的词表全是
+    「83→testing」「锁→devops」这类噪声，且唯一调用方从没传连接进来，
+    所以整条链路是死的。现在只保留这份人工维护的内置表。
+    """
+    return {
+        '爬虫': 'scraping', '爬取': 'scraping', '抓取': 'scraping',
+        'selenium': 'selenium',
+        '部署': 'deploy', '上线': 'deploy', '发布': 'deploy',
+        '报错': 'error', '异常': 'error', '失败': 'error', '出错': 'error',
+        '安装': 'install', '配置': 'config',
+        '优化': 'optimize', '加速': 'optimize', '提升': 'optimize',
+        '迁移': 'migrate', '升级': 'migrate', '替换': 'migrate',
+        '论文': 'doc', '报告': 'doc', '文档': 'doc',
+        '训练': 'training', '推理': 'inference', '微调': 'finetune',
+    }
+
+
+def normalize_keywords(keywords: list[str], synonym_map: Optional[dict] = None) -> set[str]:
+    """归一化：同义词映射 + 小写化"""
+    if synonym_map is None:
+        synonym_map = load_synonym_map()
+    return {synonym_map.get(kw, kw.lower()) for kw in keywords}
+
+
+# ── 组装 ────────────────────────────────────────────────────────
+
+def generate_tags(goal: str, approach: str, outcome: str,
+                  success_key: str = '', pitfall: str = '') -> dict[str, str]:
+    """五字段 Tag 生成；兼容原有三参数调用。"""
+    full_text = f"{goal} {approach} {outcome} {success_key} {pitfall}"
+    fixed = extract_fixed_tags(full_text)
+    keywords = extract_keywords(full_text)
+
+    return {
+        'tags_tool': fixed['tool'],
+        'tags_domain': fixed['domain'],
+        'tags_action': fixed['action'],
+        'tags_keywords': ','.join(keywords),  # 确保返回 str，不是 list
+    }
+
+
+def extract_tags_from_message(message: str, db_conn=None) -> dict[str, str]:
+    """从用户消息（非结构化文本）提取 Tag，用于召回时的查询"""
+    fixed = extract_fixed_tags(message)
+    keywords = extract_keywords(message, topk=3)
+    return {
+        'tags_tool': fixed['tool'],
+        'tags_domain': fixed['domain'],
+        'tags_action': fixed['action'],
+        'tags_keywords': ','.join(keywords),  # 修复：返回 str 而非 list
+        'project_key': infer_project_key(message),
+    }
