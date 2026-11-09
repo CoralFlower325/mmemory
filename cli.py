@@ -140,11 +140,15 @@ def cmd_link(args):
 
 
 def cmd_relations(args):
-    print(json.dumps(engine.list_relations(args.memory_id), ensure_ascii=False, indent=2))
+    print(json.dumps(engine.list_relations(
+        args.memory_id, project_key=args.project_key),
+        ensure_ascii=False, indent=2))
 
 
 def cmd_history(args):
-    print(json.dumps(engine.list_history(args.memory_id), ensure_ascii=False, indent=2))
+    print(json.dumps(engine.list_history(
+        args.memory_id, project_key=args.project_key),
+        ensure_ascii=False, indent=2))
 
 
 def cmd_purge(args):
@@ -348,9 +352,11 @@ def main():
 
     p = sub.add_parser('relations', help='查看某个实际 ID 的双向引用关系')
     p.add_argument('memory_id', type=int)
+    p.add_argument('--project-key', default=None, help='限定实际 ID 的项目')
 
     p = sub.add_parser('history', help='查看某个实际 ID 的当前记录和修订快照')
     p.add_argument('memory_id', type=int)
+    p.add_argument('--project-key', default=None, help='限定实际 ID 的项目')
 
     p = sub.add_parser('purge', help='不可恢复地删除正文、关系和修订快照')
     p.add_argument('memory_id', type=int)
@@ -421,7 +427,12 @@ def main():
         'link': cmd_link, 'relations': cmd_relations, 'review': cmd_review,
         'history': cmd_history, 'purge': cmd_purge,
     }
-    cmds[args.command](args)
+    try:
+        cmds[args.command](args)
+    except ValueError as exc:
+        print(json.dumps({'error': str(exc)}, ensure_ascii=False, indent=2),
+              file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == '__main__':

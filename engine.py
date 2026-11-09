@@ -10,7 +10,7 @@ import re
 import json
 import unicodedata
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -70,6 +70,18 @@ def conn_lock(conn: sqlite3.Connection) -> threading.RLock:
 LEGACY_PROJECT_KEY = ''
 
 
+def _validate_project_key(project_key: str) -> str:
+    value = normalize_project_key(project_key)
+    if len(value) > 120:
+        raise ValueError('project_key 最多 120 字符')
+    for char in value:
+        category = unicodedata.category(char)
+        if char in '\r\n' or ord(char) < 32 or 127 <= ord(char) < 160 or category in (
+                'Cc', 'Cf', 'Cs'):
+            raise ValueError('project_key 不能包含换行或控制字符')
+    return value
+
+
 def normalize_project_key(project_key: Optional[str]) -> str:
     """归一化项目键；None/空白值表示旧调用的兼容命名空间。"""
     if project_key is None:
@@ -80,16 +92,16 @@ def normalize_project_key(project_key: Optional[str]) -> str:
 def resolve_project_key(text: str, project_key: Optional[str] = None) -> str:
     """显式键优先；未传键时仅按高信号项目名推断。"""
     if project_key is not None:
-        return normalize_project_key(project_key)
+        return _validate_project_key(project_key)
     return infer_project_key(text)
 
 
 def resolve_recall_project_keys(text: str, project_key=None) -> list[str]:
     """解析召回作用域；显式字符串严格单项目，空串严格共享桶。"""
     if isinstance(project_key, str):
-        return [normalize_project_key(project_key)]
+        return [_validate_project_key(project_key)]
     if project_key is not None:
-        values = [normalize_project_key(value) for value in project_key]
+        values = [_validate_project_key(value) for value in project_key]
         return list(dict.fromkeys(values))
     inferred = infer_query_project_keys(text)
     return inferred or [LEGACY_PROJECT_KEY]
@@ -121,9 +133,10 @@ def _project_clause(conn: sqlite3.Connection, project_key,
     if project_key is None:
         keys = [LEGACY_PROJECT_KEY]
     elif isinstance(project_key, str):
-        keys = [normalize_project_key(project_key)]
+        keys = [_validate_project_key(project_key)]
     else:
-        keys = list(dict.fromkeys(normalize_project_key(value) for value in project_key))
+        keys = list(dict.fromkeys(_validate_project_key(value)
+                                  for value in project_key))
     prefix = f'{alias}.' if alias else ''
     if not keys:
         return ' AND 1 = 0', []
@@ -454,14 +467,13 @@ def _normalize_metadata(kind='experience', source_ref='', origin='',
             parsed[name] = ''
             continue
         try:
-            normalized = value.replace('Z', '+00:00')
-            parsed[name] = datetime.fromisoformat(normalized).isoformat(
-                sep=' ', timespec='seconds')
+            parsed[name] = _format_utc(_parse_temporal(
+                value, end_of_day=(name == 'valid_until')))
         except ValueError:
             return False, f'{name} 必须是 ISO-8601 时间', {}
     if parsed['valid_from'] and parsed['valid_until']:
-        start = datetime.fromisoformat(parsed['valid_from'].replace('Z', '+00:00'))
-        end = datetime.fromisoformat(parsed['valid_until'].replace('Z', '+00:00'))
+        start = _parse_temporal(parsed['valid_from'])
+        end = _parse_temporal(parsed['valid_until'])
         if end < start:
             return False, 'valid_until 不能早于 valid_from', {}
     return True, '元数据有效', {
@@ -471,6 +483,42 @@ def _normalize_metadata(kind='experience', source_ref='', origin='',
         'verification': verification,
         **parsed,
     }
+
+
+def _parse_temporal(value: str, *, end_of_day: bool = False) -> datetime:
+    text = str(value or '').strip()
+    date_only = bool(re.fullmatch(r'\d{4}-\d{2}-\d{2}', text))
+    parsed = datetime.fromisoformat(text.replace('Z', '+00:00'))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    if end_of_day and date_only:
+        parsed = parsed.replace(hour=23, minute=59, second=59)
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(
+        sep=' ', timespec='seconds')
+
+
+def _validity_state(row: dict, *, now: Optional[datetime] = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    for field, label, is_before in (
+            ('valid_from', 'future', True),
+            ('valid_until', 'expired', False)):
+        value = str(row.get(field) or '').strip()
+        if not value:
+            continue
+        try:
+            boundary = _parse_temporal(
+                value, end_of_day=(field == 'valid_until'))
+        except ValueError:
+            continue
+        if is_before and now < boundary:
+            return label
+        if not is_before and now > boundary:
+            return label
+    return ''
 
 
 def _record_revision(conn: sqlite3.Connection, row: dict, reason: str):
@@ -563,9 +611,20 @@ def _store_locked(conn, own_conn, goal, approach, outcome,
                 return {'stored': False,
                         'reason': '目标涉及多个项目，请显式指定 project_key',
                         'memory_id': None}
-            project_key = ((goal_projects[0] if goal_projects else '')
-                           or infer_project_key(f"{approach} {outcome} {success_key} {pitfall}"))
-        project_key = normalize_project_key(project_key)
+            if goal_projects:
+                project_key = goal_projects[0]
+            else:
+                other_projects = project_keys_in_text(
+                    f'{approach} {outcome} {success_key} {pitfall}')
+                if len(other_projects) > 1:
+                    return {'stored': False,
+                            'reason': '内容涉及多个项目，请显式指定 project_key',
+                            'memory_id': None}
+                project_key = other_projects[0] if other_projects else ''
+        try:
+            project_key = _validate_project_key(project_key)
+        except ValueError as exc:
+            return {'stored': False, 'reason': str(exc), 'memory_id': None}
 
         # 长度与字段合同对直接 API、CLI 和自动消费者都必须一致。
         validation_ok, validation_reason, cleaned = mmemory_filter.validate_fields(
@@ -1057,11 +1116,19 @@ def link_memories(source_id: int, target_id: int, relation: str, reason: str, *,
                 conn.close()
 
 
-def list_relations(memory_id: int, db_conn: Optional[sqlite3.Connection] = None) -> list[dict]:
+def list_relations(memory_id: int, *, project_key: Optional[str] = None,
+                   db_conn: Optional[sqlite3.Connection] = None) -> list[dict]:
     """列出指定 ID 的出向和入向引用，包括归档来源。"""
     conn = db_conn or get_conn()
     own_conn = db_conn is None
     try:
+        clause, params = ('', []) if project_key is None else _project_clause(
+            conn, project_key)
+        visible = conn.execute(
+            f'SELECT 1 FROM memories WHERE id=? {clause}',
+            (memory_id, *params)).fetchone()
+        if visible is None:
+            return []
         rows = conn.execute('''SELECT * FROM memory_relations WHERE source_id=? OR target_id=?
                                ORDER BY created_at,source_id,target_id,relation''',
                             (memory_id, memory_id)).fetchall()
@@ -1071,16 +1138,20 @@ def list_relations(memory_id: int, db_conn: Optional[sqlite3.Connection] = None)
             conn.close()
 
 
-def list_history(memory_id: int,
+def list_history(memory_id: int, *, project_key: Optional[str] = None,
                  db_conn: Optional[sqlite3.Connection] = None) -> dict:
     """返回当前记录与按修订号排序的历史快照。"""
     conn = db_conn or get_conn()
     own_conn = db_conn is None
     try:
-        current = conn.execute('SELECT * FROM memories WHERE id=?',
-                               (memory_id,)).fetchone()
+        clause, params = ('', []) if project_key is None else _project_clause(
+            conn, project_key)
+        current = conn.execute(
+            f'SELECT * FROM memories WHERE id=? {clause}',
+            (memory_id, *params)).fetchone()
         if current is None:
-            return {'memory_id': memory_id, 'current': None, 'revisions': []}
+            return {'memory_id': memory_id, 'current': None, 'revisions': [],
+                    'found': False}
         revisions = []
         for row in conn.execute("""
             SELECT revision, snapshot, reason, created_at
@@ -1099,6 +1170,7 @@ def list_history(memory_id: int,
             })
         return {
             'memory_id': memory_id,
+            'found': True,
             'current': dict(current),
             'revisions': revisions,
         }
@@ -1113,15 +1185,26 @@ def rebuild_search_index(db_conn: Optional[sqlite3.Connection] = None) -> dict:
     own_conn = db_conn is None
     with conn_lock(conn):
         own_tx = not conn.in_transaction
+        sp_open = False
         try:
             if own_tx:
                 conn.execute('BEGIN IMMEDIATE')
             count = conn.execute('SELECT count(*) FROM memories').fetchone()[0]
+            conn.execute('SAVEPOINT mm_reindex')
+            sp_open = True
             _rebuild_search_text(conn)
+            conn.execute('RELEASE mm_reindex')
+            sp_open = False
             if own_tx:
                 conn.commit()
             return {'rebuilt': True, 'indexed': count}
         except Exception:
+            if sp_open:
+                try:
+                    conn.execute('ROLLBACK TO mm_reindex')
+                    conn.execute('RELEASE mm_reindex')
+                except sqlite3.Error:
+                    pass
             if own_tx:
                 conn.rollback()
             raise
@@ -1136,7 +1219,8 @@ def purge_memory(memory_id: int, reason: str, *,
     """不可恢复地删除一条记忆及其关系、修订快照。"""
     import filter as mmemory_filter
     memory_id = int(memory_id)
-    result = {'purged': False, 'memory_id': memory_id, 'reason': ''}
+    result = {'purged': False, 'memory_id': memory_id,
+              'physical_cleanup': False, 'reason': ''}
     if memory_id <= 0:
         return {**result, 'reason': '须提供有效的实际记忆 ID'}
     if mmemory_filter.is_blank(reason):
@@ -1147,6 +1231,7 @@ def purge_memory(memory_id: int, reason: str, *,
         own_tx = not conn.in_transaction
         sp_open = False
         try:
+            conn.execute('PRAGMA secure_delete=ON')
             if own_tx:
                 conn.execute('BEGIN IMMEDIATE')
             clause, params = ('', []) if project_key is None else _project_clause(conn, project_key)
@@ -1169,8 +1254,22 @@ def purge_memory(memory_id: int, reason: str, *,
             sp_open = False
             if own_tx:
                 conn.commit()
+            cleanup_error = ''
+            if own_conn:
+                try:
+                    conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                    conn.execute('VACUUM')
+                    conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                except sqlite3.Error as exc:
+                    cleanup_error = str(exc)
             return {**result, 'purged': True,
-                    'reason': '记忆正文、关系与修订快照已删除'}
+                    'physical_cleanup': bool(own_conn) and not cleanup_error,
+                    'reason': (
+                        '记忆正文、关系与修订快照已删除并压缩数据库'
+                        if own_conn and not cleanup_error else
+                        f'记忆已逻辑删除，但物理压缩失败：{cleanup_error}'
+                        if own_conn else
+                        '记忆已逻辑删除；调用方事务提交后需自行 VACUUM')}
         except Exception:
             if sp_open:
                 conn.execute('ROLLBACK TO mm_purge')
@@ -1352,7 +1451,7 @@ def _recall_locked(conn, own_conn, message, limit, reinforce, project_key,
         required_groups = [_term_group(term) for term in required_terms]
         identity_groups = [
             group for group in required_groups
-            if len(required_groups) > 1 and any(
+            if any(
                 re.fullmatch(r'(?i)v\d+|[a-z]*\d{3,}[a-z0-9_-]*', term)
                 for term in group)
         ]
@@ -1371,38 +1470,35 @@ def _recall_locked(conn, own_conn, message, limit, reinforce, project_key,
         superseded_by = {}
         if _has_column(conn, 'memory_relations', 'source_id'):
             relation_rows = conn.execute("""
-                SELECT r.target_id, r.source_id
+                SELECT r.target_id, r.source_id,
+                       source.status AS source_status,
+                       source.valid_from AS source_valid_from,
+                       source.valid_until AS source_valid_until,
+                       source.project_key AS source_project,
+                       target.project_key AS target_project
                 FROM memory_relations r
                 JOIN memories source ON source.id=r.source_id
+                JOIN memories target ON target.id=r.target_id
                 WHERE r.relation='supersedes'
             """).fetchall()
-            superseded_by = {row['target_id']: row['source_id']
-                             for row in relation_rows}
-
-        def validity_state(row):
-            now = datetime.now()
-            for field, label, is_before in (
-                    ('valid_from', 'future', True),
-                    ('valid_until', 'expired', False)):
-                value = str(row.get(field) or '').strip()
-                if not value:
+            for row in relation_rows:
+                if normalize_project_key(row['source_project']) != normalize_project_key(
+                        row['target_project']):
                     continue
-                try:
-                    boundary = datetime.fromisoformat(value.replace('Z', '+00:00'))
-                    if boundary.tzinfo is not None:
-                        boundary = boundary.replace(tzinfo=None)
-                    if is_before and now < boundary:
-                        return label
-                    if not is_before and now > boundary:
-                        return label
-                except ValueError:
+                source_validity = _validity_state({
+                    'valid_from': row['source_valid_from'],
+                    'valid_until': row['source_valid_until'],
+                })
+                if row['source_status'] == 'active' and source_validity:
                     continue
-            return ''
+                if row['source_status'] not in ('active', 'archived'):
+                    continue
+                superseded_by[row['target_id']] = row['source_id']
 
         def order(row):
             mid = row['id']
             return (-int(row.get('status') == 'active'),
-                    -int(not validity_state(row)),
+                    -int(not _validity_state(row)),
                     -int(mid not in superseded_by),
                     -required_hits[mid], -hits[mid], -matched_chars[mid],
                     text_rank.get(mid, candidate_limit), -int('tag' in sources[mid]),
@@ -1422,9 +1518,10 @@ def _recall_locked(conn, own_conn, message, limit, reinforce, project_key,
             # Django/Google 或相邻版本带进来；长词仍可单独召回。
             if any(not _term_group_in_text(group, body) for group in short_groups):
                 continue
-            if row['id'] in superseded_by and not include_superseded:
+            if (row['id'] in superseded_by
+                    and not (include_superseded or deep)):
                 continue
-            state = validity_state(row)
+            state = _validity_state(row)
             if state and not include_expired:
                 continue
             enriched = dict(row)
@@ -1588,9 +1685,14 @@ def _query_terms(query: str, *, include_generic: bool = False,
 
     # 章节编号与单字母题号是有意义标识，必须在 jieba 把 A题 拆成 A/题 前提取。
     for token in re.findall(
-            r'(?:第[0-9一二三四五六七八九十百]+[章节问题])+|(?:[A-Za-z][题卷章节])',
+            r'(?:第[0-9一二三四五六七八九十百千零〇两]+[章节问题])+|(?:[A-Za-z][题卷章节])',
             query or ''):
         add(token)
+    for letter, unit in re.findall(r'(?i)\b([A-Za-z])\s+([题卷章节])\b', query or ''):
+        add(letter + unit)
+    for prefix, digits in re.findall(
+            r'(?i)\b([A-Za-z]{2,8})\s+(\d{3,})\b', query or ''):
+        add(prefix + digits)
     for chunk in re.findall(r'[\u4e00-\u9fff]+|[^\s\u4e00-\u9fff]+', query or ''):
         tokens = jieba.cut(chunk) if re.search(r'[\u4e00-\u9fff]', chunk) else [chunk]
         for token in tokens:
@@ -1598,9 +1700,12 @@ def _query_terms(query: str, *, include_generic: bool = False,
             cleaned = _clean_query_token(token)
             # API401、V33 等紧凑标识参与 FTS 的同时拆出字母与数字，使正文里
             # “API 401”也能命中；普通单字母仍被 add() 丢弃。
-            if (cleaned.isascii() and re.search(r'[A-Z]', cleaned)
+            if (cleaned.isascii()
                     and re.fullmatch(r'[A-Za-z]+\d+|\d+[A-Za-z]+', cleaned)):
-                for part in re.findall(r'[A-Za-z]+|\d+', cleaned):
+                parts = re.findall(r'[A-Za-z]+|\d+', cleaned)
+                if not any(part.isdigit() and len(part) >= 3 for part in parts):
+                    continue
+                for part in parts:
                     add(part)
     if max_terms is not None:
         return sorted(terms, key=lambda term: -len(term))[:max_terms]
@@ -1648,8 +1753,24 @@ def _term_in_text(term: str, text: str) -> bool:
     folded_term = unicodedata.normalize('NFC', term or '').casefold()
     folded_text = unicodedata.normalize('NFC', text or '').casefold()
     if folded_term.isascii():
-        pattern = rf'(?<![a-z0-9]){re.escape(folded_term)}(?![a-z0-9])'
-        return re.search(pattern, folded_text) is not None
+        boundary_word = 'a-z0-9_-' if len(folded_term) <= 2 or '-' in folded_term else 'a-z0-9-'
+        pattern = (
+            rf'(?<![{boundary_word}]){re.escape(folded_term)}'
+            rf'(?![{boundary_word}])'
+            if folded_term[0].isalnum() and folded_term[-1].isalnum()
+            else re.escape(folded_term)
+        )
+        if re.search(pattern, folded_text):
+            return True
+        if re.fullmatch(r'[a-z]{2,8}', folded_term):
+            return re.search(
+                rf'(?<![a-z0-9_-]){re.escape(folded_term)}(?=[0-9]{{3,}})',
+                folded_text) is not None
+        if re.fullmatch(r'\d{3,}', folded_term):
+            return re.search(
+                rf'(?<![a-z0-9_-])[a-z]+\d*{re.escape(folded_term)}'
+                rf'(?![a-z0-9_-])', folded_text) is not None
+        return False
     if re.fullmatch(r'[a-z][题卷章节]', folded_term):
         pattern = rf'(?<![a-z0-9]){re.escape(folded_term[0])}\s*{re.escape(folded_term[1])}'
         return re.search(pattern, folded_text) is not None
@@ -1952,22 +2073,48 @@ def get_stats(db_conn: Optional[sqlite3.Connection] = None,
         by_verification = {row[0] or 'unverified': row[1] for row in conn.execute(
             f"SELECT verification, COUNT(*) FROM memories WHERE 1=1 {project_sql} "
             "GROUP BY verification", project_params)}
-        expired = conn.execute(
-            f"""SELECT COUNT(*) FROM memories
-                WHERE status='active' AND valid_until <> ''
-                  AND datetime(valid_until) < datetime('now','localtime')
-                  {project_sql}""", project_params).fetchone()[0]
-        future = conn.execute(
-            f"""SELECT COUNT(*) FROM memories
-                WHERE status='active' AND valid_from <> ''
-                  AND datetime(valid_from) > datetime('now','localtime')
-                  {project_sql}""", project_params).fetchone()[0]
-        superseded = conn.execute(
-            f"""SELECT COUNT(DISTINCT r.target_id)
-                FROM memory_relations r
-                JOIN memories m ON m.id=r.target_id
-                WHERE r.relation='supersedes' AND 1=1 {project_sql}""",
-            project_params).fetchone()[0]
+        now_utc = datetime.now(timezone.utc)
+        expired = future = 0
+        temporal_rows = conn.execute(
+            f"""SELECT valid_from, valid_until FROM memories
+                WHERE status='active' {project_sql}""",
+            project_params).fetchall()
+        for row in temporal_rows:
+            try:
+                start = _parse_temporal(row['valid_from']) if row['valid_from'] else None
+                end = _parse_temporal(
+                    row['valid_until'], end_of_day=True) if row['valid_until'] else None
+            except ValueError:
+                continue
+            if end is not None and now_utc > end:
+                expired += 1
+            if start is not None and now_utc < start:
+                future += 1
+        superseded_ids = set()
+        relation_rows = conn.execute("""
+            SELECT r.target_id, source.status AS source_status,
+                   source.valid_from, source.valid_until,
+                   source.project_key AS source_project,
+                   target.project_key AS target_project
+            FROM memory_relations r
+            JOIN memories source ON source.id=r.source_id
+            JOIN memories target ON target.id=r.target_id
+            WHERE r.relation='supersedes'
+        """).fetchall()
+        if project_key is not None:
+            wanted = normalize_project_key(project_key)
+        for row in relation_rows:
+            if normalize_project_key(row['source_project']) != normalize_project_key(
+                    row['target_project']):
+                continue
+            if project_key is not None and normalize_project_key(
+                    row['target_project']) != wanted:
+                continue
+            if row['source_status'] == 'active' and _validity_state(row):
+                continue
+            if row['source_status'] in ('active', 'archived'):
+                superseded_ids.add(row['target_id'])
+        superseded = len(superseded_ids)
         unused = conn.execute(
             f"""SELECT COUNT(*) FROM memories
                 WHERE status='active' AND COALESCE(use_count,0)=0
@@ -1980,10 +2127,8 @@ def get_stats(db_conn: Optional[sqlite3.Connection] = None,
         oldest_days = None
         if oldest:
             try:
-                parsed = datetime.fromisoformat(str(oldest).replace('Z', '+00:00'))
-                if parsed.tzinfo is not None:
-                    parsed = parsed.replace(tzinfo=None)
-                oldest_days = max(0, (datetime.now() - parsed).days)
+                parsed = _parse_temporal(str(oldest))
+                oldest_days = max(0, (now_utc - parsed).days)
             except ValueError:
                 oldest_days = None
         return {
@@ -2006,7 +2151,7 @@ def get_stats(db_conn: Optional[sqlite3.Connection] = None,
 
 def format_memory_summary(m: dict, index: int = 0) -> str:
     """列表默认摘要：只显示身份、目标、结果和必要状态。"""
-    project = str(m.get('project_key') or '').strip()
+    project = _clip_text(m.get('project_key'), 120)
     scope = f'[{project}] ' if project else ''
     flags = []
     if m.get('status') == 'archived':
@@ -2036,22 +2181,24 @@ def format_memory_summary(m: dict, index: int = 0) -> str:
 
 def format_memory(m: dict, index: int = 0) -> str:
     """格式化单条记忆用于注入上下文"""
-    project = m.get('project_key', '')
+    project = _clean_display(m.get('project_key', ''))
     scope = f"{project}|" if project else ''
-    prefix = f"[{scope}{m['tags_domain']}/{m['tags_tool']}/{m['tags_action']}]"
-    lines = [f"{index}. #{m['id']} {prefix} 目标：{m['goal']}"]
-    lines.append(f"   方案：{m['approach']}")
-    lines.append(f"   结果：{m['outcome']}")
+    prefix = f"[{scope}{_clean_display(m.get('tags_domain'))}/" \
+             f"{_clean_display(m.get('tags_tool'))}/" \
+             f"{_clean_display(m.get('tags_action'))}]"
+    lines = [f"{index}. #{m['id']} {prefix} 目标：{_clean_display(m['goal'])}"]
+    lines.append(f"   方案：{_clean_display(m['approach'])}")
+    lines.append(f"   结果：{_clean_display(m['outcome'])}")
     if m.get('success_key'):
-        lines.append(f"   成功关键：{m['success_key']}")
+        lines.append(f"   成功关键：{_clean_display(m['success_key'])}")
     if m.get('pitfall'):
-        lines.append(f"   踩坑+解法：{m['pitfall']}")
+        lines.append(f"   踩坑+解法：{_clean_display(m['pitfall'])}")
     lines.append(f"   类型：{m.get('kind') or 'experience'}")
     lines.append(f"   验证状态：{m.get('verification') or 'unverified'}")
     if m.get('source_ref'):
-        lines.append(f"   来源标识：{m['source_ref']}")
+        lines.append(f"   来源标识：{_clean_display(m['source_ref'])}")
     if m.get('origin'):
-        lines.append(f"   来源说明：{m['origin']}")
+        lines.append(f"   来源说明：{_clean_display(m['origin'])}")
     if m.get('valid_from') or m.get('valid_until'):
         lines.append(
             f"   有效区间：{m.get('valid_from') or '不限'} -> "
@@ -2059,9 +2206,18 @@ def format_memory(m: dict, index: int = 0) -> str:
     return '\n'.join(lines)
 
 
+def _clean_display(text) -> str:
+    value = str(text or '')
+    chars = []
+    for char in value:
+        category = unicodedata.category(char)
+        chars.append(' ' if category in ('Cc', 'Cf', 'Cs') else char)
+    return ' '.join(''.join(chars).split())
+
+
 def _clip_text(text, limit: int) -> str:
     """压缩成单行摘要；完整正文仍可通过 list 查看。"""
-    value = ' '.join(str(text or '').split())
+    value = _clean_display(text)
     if len(value) <= limit:
         return value
     return value[:max(1, limit - 1)].rstrip() + '…'
@@ -2079,13 +2235,9 @@ def _clip_lesson(text, limit: int = 180) -> str:
 
 def format_recall_context(m: dict, index: int = 0) -> str:
     """召回上下文条目：保留目标、结果和一条可复用教训，限制单条长度。"""
-    project = str(m.get('project_key') or '').strip()
+    project = _clean_display(m.get('project_key'))
     scope = f'[{project}] ' if project else ''
     flags = []
-    if m.get('kind') and m.get('kind') != 'experience':
-        flags.append(str(m['kind']))
-    if m.get('verification') and m.get('verification') != 'unverified':
-        flags.append(str(m['verification']))
     if m.get('status') == 'archived':
         flags.append('archived')
     if m.get('_superseded_by'):
@@ -2101,8 +2253,6 @@ def format_recall_context(m: dict, index: int = 0) -> str:
     lesson = m.get('pitfall') or m.get('success_key') or m.get('approach')
     if lesson:
         lines.append(f"   要点：{_clip_lesson(lesson, 180)}")
-    if m.get('source_ref'):
-        lines.append(f"   来源：{_clip_text(m.get('source_ref'), 120)}")
     return '\n'.join(lines)
 
 

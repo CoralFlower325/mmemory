@@ -170,12 +170,12 @@ slowly than experiences and project facts.
 | `store` | Add a five-field memory or validate an imported conversation |
 | `recall` | Search one project; supports `--explain`, `--deep`, validity, supersession, and explicit reinforcement |
 | `update ID` | Revise text while preserving project and usage metadata |
-| `history ID` | Inspect the current row and prior snapshots |
+| `history ID --project-key ...` | Inspect the current row and prior snapshots inside one project scope |
 | `list` | Inspect active, archived, or all memories |
 | `protect` / `unprotect` | Exempt or resume decay by explicit ID and reason |
 | `archive` / `restore` | Transition memory status without changing its ID |
 | `review` | Read-only duplicate, conflict, and mixed-project clues |
-| `link` / `relations` | Record and inspect `supersedes` or `derived_from` evidence |
+| `link` / `relations --project-key ...` | Record and inspect `supersedes` or `derived_from` evidence within one project scope |
 | `decay` | Preview or apply elapsed-time decay and threshold archival |
 | `dream` | Produce manual merge candidates; never edits automatically |
 | `reindex` | Rebuild jieba tokens and the FTS5 index |
@@ -204,7 +204,8 @@ the derived search index. Use `reindex` after external SQL edits.
 `review` is evidence, not a semantic judge. `dream` is a manual dry run. Merge
 application is atomic, rejects groups containing protected sources, and records
 derived-from relations instead of silently deleting history. `purge` is the
-separate irreversible path for sensitive content.
+separate irreversible path for sensitive content; an owned connection enables
+secure deletion, checkpointing, and `VACUUM`.
 
 Before maintaining a real database, create a consistent snapshot:
 
@@ -223,8 +224,10 @@ Export active memories as Markdown:
 ```
 
 The default destination is `./obsidian-export`. Override it with
-`MMEMORY_OBSIDIAN_DIR`. Export is one-way: mmemory writes IDs into generated
-files and cleans only files carrying its own marker.
+`MMEMORY_OBSIDIAN_DIR`. A destination must be empty or already carry
+`.mmemory-export.json`; mmemory refuses to take over an unmarked nonempty
+directory. Export is one-way: mmemory writes IDs into generated files and cleans
+only files carrying its own marker.
 
 ## Data And Privacy
 

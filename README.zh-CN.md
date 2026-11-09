@@ -165,12 +165,12 @@ project_fact。
 | `store` | 写入五字段记忆或校验导入会话 |
 | `recall` | 在单个项目内召回，支持解释、深层、有效期、取代关系和显式强化 |
 | `update ID` | 修订正文并保留项目和真实使用元数据 |
-| `history ID` | 查看当前记录和历史快照 |
+| `history ID --project-key ...` | 在项目作用域内查看当前记录和历史快照 |
 | `list` | 查看活跃、归档或全部记忆 |
 | `protect` / `unprotect` | 按具体 ID 与理由保护或恢复衰减 |
 | `archive` / `restore` | 切换状态并保留原 ID |
 | `review` | 只读列出重复、冲突和混合项目线索 |
-| `link` / `relations` | 记录和查看 `supersedes` / `derived_from` 证据 |
+| `link` / `relations --project-key ...` | 在项目作用域内记录和查看 `supersedes` / `derived_from` 证据 |
 | `decay` | 预览或应用经过时长的衰减与低权重归档 |
 | `dream` | 生成手动合并候选，不自动修改正文 |
 | `reindex` | 重建 jieba 检索词和 FTS5 索引 |
@@ -196,7 +196,8 @@ mmemory 区分三个时间概念：
 
 `review` 提供证据，不进行语义裁决。`dream` 始终是手动 dry run。合并写入
 在一个事务中完成，拒绝包含受保护来源的组，并记录来源关系，而不是静默
-删除历史。敏感正文需要使用单独的不可恢复 `purge` 路径。
+删除历史。敏感正文需要使用单独的不可恢复 `purge` 路径；由 mmemory 自己
+持有的连接会启用安全删除、checkpoint 和 `VACUUM`。
 
 维护真实数据库前先生成一致快照：
 
@@ -215,7 +216,9 @@ mmemory 区分三个时间概念：
 ```
 
 默认目录是 `./obsidian-export`，可用 `MMEMORY_OBSIDIAN_DIR` 覆盖。导出为
-单向流程：mmemory 在生成文件中写入 ID，只清理带自身标记的旧文件。
+单向流程：目标目录必须为空或已有 `.mmemory-export.json`，否则 mmemory 会
+拒绝接管未标记的非空目录。mmemory 在生成文件中写入 ID，只清理带自身标记
+的旧文件。
 
 ## 数据与隐私
 

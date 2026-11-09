@@ -117,7 +117,8 @@ def review_candidates(*, project_key=None, status='active', limit=50,
     limit = int(limit)
     if not 1 <= limit <= 500:
         raise ValueError('limit 须为 1 到 500')
-    project = None if project_key is None else str(project_key).strip()
+    project = (None if project_key is None
+               else engine.normalize_project_key(project_key))
     own_conn = db_conn is None
     conn = db_conn if db_conn is not None else sqlite3.connect(
         Path(engine.DB_PATH).expanduser().resolve().as_uri() + '?mode=ro', uri=True)
@@ -125,10 +126,12 @@ def review_candidates(*, project_key=None, status='active', limit=50,
         with engine.conn_lock(conn):
             if own_conn:
                 conn.execute('BEGIN')
-            clause = '' if project is None else ' WHERE COALESCE(project_key,\'\') = ?'
-            all_memories = _rows(conn, 'SELECT * FROM memories' + clause + ' ORDER BY id',
-                                 () if project is None else (project,))
-            memories = [row for row in all_memories if status == 'all' or row['status'] == status]
+            all_memories = _rows(conn, 'SELECT * FROM memories ORDER BY id')
+            memories = [
+                row for row in all_memories
+                if (project is None or (row.get('project_key') or '') == project)
+                and (status == 'all' or row['status'] == status)
+            ]
             by_id = {row['id']: row for row in all_memories}
             selected_ids = {row['id'] for row in memories}
             if relations is None:

@@ -132,7 +132,7 @@ record("dream", "Dream返回完整结构", "P1", expected_keys.issubset(dream_re
 # ── 6. Obsidian 导出 ──────────────────────────────────────────
 print("\n[6] Obsidian 导出")
 import obsidian_export
-test_dir = pathlib.Path("/tmp/mmemory_test_obsidian_clean")
+test_dir = pathlib.Path(tempfile.mkdtemp(prefix="mmemory_test_obsidian_clean_"))
 obsidian_export.OBSIDIAN_DIR = test_dir
 
 # Patch DB_PATH to use temp DB for export
