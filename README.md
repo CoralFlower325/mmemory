@@ -204,7 +204,8 @@ the derived search index. Use `reindex` after external SQL edits.
 `review` is evidence, not a semantic judge. `dream` is a manual dry run. Merge
 application is atomic, rejects groups containing protected sources, and records
 derived-from relations instead of silently deleting history. `purge` is the
-separate irreversible path for sensitive content.
+separate irreversible path for sensitive content; an owned connection enables
+secure deletion, checkpointing, and `VACUUM`.
 
 Before maintaining a real database, create a consistent snapshot:
 
@@ -223,8 +224,10 @@ Export active memories as Markdown:
 ```
 
 The default destination is `./obsidian-export`. Override it with
-`MMEMORY_OBSIDIAN_DIR`. Export is one-way: mmemory writes IDs into generated
-files and cleans only files carrying its own marker.
+`MMEMORY_OBSIDIAN_DIR`. A destination must be empty or already carry
+`.mmemory-export.json`; mmemory refuses to take over an unmarked nonempty
+directory. Export is one-way: mmemory writes IDs into generated files and cleans
+only files carrying its own marker.
 
 ## Data And Privacy
 

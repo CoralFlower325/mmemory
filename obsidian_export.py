@@ -7,6 +7,7 @@ obsidian_export.py — mmemory → Obsidian 单向导出
 import os
 import sys
 import re
+import json
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import quote
@@ -19,6 +20,41 @@ OBSIDIAN_DIR = Path(os.environ.get(
     "MMEMORY_OBSIDIAN_DIR",
     Path(__file__).resolve().parent / "obsidian-export",
 ))
+OWNERSHIP_MARKER = '.mmemory-export.json'
+MARKER_VERSION = 1
+
+
+def _read_marker(directory: Path) -> dict:
+    marker = directory / OWNERSHIP_MARKER
+    if not marker.exists():
+        if any(directory.iterdir()):
+            raise RuntimeError(
+                f'拒绝操作非空且未标记的目录：{directory}；'
+                f'请使用专用导出目录，或确认后手动创建 {OWNERSHIP_MARKER}')
+        data = {'version': MARKER_VERSION, 'managed_dirs': []}
+    else:
+        try:
+            data = json.loads(marker.read_text(encoding='utf-8'))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f'导出目录标记损坏：{marker}: {exc}') from exc
+    if data.get('version') != MARKER_VERSION or not isinstance(
+            data.get('managed_dirs'), list):
+        raise RuntimeError(f'不支持的导出目录标记：{marker}')
+    data['managed_dirs'] = [
+        str(name) for name in data['managed_dirs']
+        if isinstance(name, str) and name and '/' not in name and '\\' not in name
+    ]
+    return data
+
+
+def _write_marker(directory: Path, managed_dirs: set[str]):
+    (directory / OWNERSHIP_MARKER).write_text(
+        json.dumps({
+            'version': MARKER_VERSION,
+            'managed_dirs': sorted(managed_dirs),
+        }, ensure_ascii=False, indent=2) + '\n',
+        encoding='utf-8',
+    )
 
 
 def _is_mmemory_file(filepath: Path) -> bool:
@@ -96,6 +132,8 @@ def memory_to_markdown(m: dict) -> str:
 def export_all():
     """导出所有 active 记忆到 Obsidian"""
     OBSIDIAN_DIR.mkdir(parents=True, exist_ok=True)
+    marker = _read_marker(OBSIDIAN_DIR)
+    managed_dirs = set(marker['managed_dirs'])
 
     conn = engine.get_conn()
     try:
@@ -120,6 +158,7 @@ def export_all():
         if domain in ('', '.', '..'):
             domain = 'general'
         groups.setdefault(domain, []).append(m)
+        managed_dirs.add(domain)
 
     # 增量更新：收集当前应存在的文件路径
     expected_files: set[Path] = set()
@@ -156,10 +195,12 @@ def export_all():
                     f.unlink()
                     removed += 1
 
-    # 清理空目录
-    for domain_dir in list(OBSIDIAN_DIR.iterdir()):
+    # 只清理曾由 mmemory 管理的空目录，不碰用户自己的空目录。
+    for name in list(managed_dirs):
+        domain_dir = OBSIDIAN_DIR / name
         if domain_dir.is_dir() and not any(domain_dir.iterdir()):
             domain_dir.rmdir()
+            managed_dirs.discard(name)
 
     # 生成索引文件
     index_lines = [
@@ -184,6 +225,7 @@ def export_all():
         index_lines.append("")
 
     (OBSIDIAN_DIR / "index.md").write_text('\n'.join(index_lines), encoding='utf-8')
+    _write_marker(OBSIDIAN_DIR, managed_dirs)
 
     print(f"导出完成: 新建 {created} / 更新 {updated} / 删除 {removed} → {len(groups)} 个领域目录")
     for domain, mems in sorted(groups.items()):

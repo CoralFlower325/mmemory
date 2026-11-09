@@ -178,11 +178,21 @@ def _reject_duplicate_aliases(project_map: dict[str, tuple[str, ...]],
 PROJECT_KEYWORDS, QUERY_PROJECT_KEYWORDS = load_project_config()
 
 
+def ascii_token_pattern(term: str) -> str:
+    """为 ASCII 标识构造边界，连字符和下划线都视为标识内部字符。"""
+    escaped = re.escape(term)
+    if term and term[0].isascii() and (term[0].isalnum() or term[0] in '_-'):
+        escaped = r'(?<![a-z0-9_-])' + escaped
+    if term and term[-1].isascii() and (term[-1].isalnum() or term[-1] in '_-'):
+        escaped += r'(?![a-z0-9_-])'
+    return escaped
+
+
 def _alias_in_text(alias: str, text: str) -> bool:
     lowered = unicodedata.normalize('NFC', text or '').casefold()
     alias = unicodedata.normalize('NFC', alias).casefold()
-    if alias.isascii() and alias.isalnum():
-        return re.search(rf'(?<![a-z0-9_]){re.escape(alias)}(?![a-z0-9_])', lowered) is not None
+    if alias.isascii():
+        return re.search(ascii_token_pattern(alias), lowered) is not None
     return alias in lowered
 
 
@@ -192,8 +202,8 @@ def _keyword_matches(text: str, keywords) -> list[tuple[int, int, str]]:
     for project, aliases in keywords:
         for alias in aliases:
             needle = unicodedata.normalize('NFC', alias).casefold()
-            if needle.isascii() and needle.isalnum():
-                pattern = rf'(?<![a-z0-9_]){re.escape(needle)}(?![a-z0-9_])'
+            if needle.isascii():
+                pattern = ascii_token_pattern(needle)
                 spans = (m.span() for m in re.finditer(pattern, normalized))
             else:
                 spans = (m.span() for m in re.finditer(re.escape(needle), normalized))
@@ -375,8 +385,8 @@ DEFAULT_TERM_EQUIVALENTS: dict[str, tuple[str, ...]] = {
     '验证': ('驗證',),
     '驗證': ('验证',),
     '数据库': ('數據庫', '資料庫'),
-    '數據庫': ('数据库',),
-    '資料庫': ('数据库',),
+    '數據庫': ('数据库', '資料庫'),
+    '資料庫': ('数据库', '數據庫'),
 }
 
 
@@ -424,19 +434,23 @@ def _parse_small_chinese_number(text: str) -> Optional[int]:
         return None
     if text.isdigit():
         return int(text)
-    if '百' in text:
-        left, _, right = text.partition('百')
-        hundreds = _CN_DIGITS.get(left, 1) if left else 1
-        rest = _parse_small_chinese_number(right) if right else 0
-        return hundreds * 100 + (rest or 0) if rest is not None else None
-    if '十' in text:
-        left, _, right = text.partition('十')
-        tens = _CN_DIGITS.get(left, 1) if left else 1
-        ones = _CN_DIGITS.get(right, 0) if right else 0
-        return tens * 10 + ones
-    if len(text) == 1:
-        return _CN_DIGITS.get(text)
-    return None
+    units = {'十': 10, '百': 100, '千': 1000}
+    total = 0
+    current = 0
+    seen = False
+    for char in text:
+        if char in _CN_DIGITS:
+            current = _CN_DIGITS[char]
+            seen = True
+        elif char in units:
+            seen = True
+            total += (current or 1) * units[char]
+            current = 0
+        elif char in ('零', '〇'):
+            continue
+        else:
+            return None
+    return total + current if seen else None
 
 
 def _format_small_chinese_number(value: int) -> str:
@@ -456,15 +470,23 @@ def _format_small_chinese_number(value: int) -> str:
         if rest < 10:
             return head + '零' + digits[rest]
         return head + _format_small_chinese_number(rest)
+    if value < 10000:
+        thousands, rest = divmod(value, 1000)
+        head = digits[thousands] + '千'
+        if rest == 0:
+            return head
+        if rest < 100:
+            head += '零'
+        return head + _format_small_chinese_number(rest)
     return str(value)
 
 
 def _numeric_equivalents(term: str) -> tuple[str, ...]:
-    match = re.fullmatch(r'第(\d+)([题卷章节])', term)
+    match = re.fullmatch(r'第(\d+)([题卷章节问])', term)
     if match:
         value = int(match.group(1))
         return (f'第{_format_small_chinese_number(value)}{match.group(2)}',)
-    match = re.fullmatch(r'第([零〇一二两三四五六七八九十百]+)([题卷章节])', term)
+    match = re.fullmatch(r'第([零〇一二两三四五六七八九十百]+)([题卷章节问])', term)
     if match:
         value = _parse_small_chinese_number(match.group(1))
         if value is not None:
@@ -478,7 +500,10 @@ def search_term_equivalents(term: str) -> tuple[str, ...]:
     values = list(TERM_EQUIVALENTS.get(folded, ()))
     synonym_map = load_synonym_map()
     canonical = synonym_map.get(folded)
+    values.extend(key for key, value in synonym_map.items()
+                  if value == folded and key != folded)
     if canonical:
+        values.append(canonical)
         values.extend(key for key, value in synonym_map.items()
                       if value == canonical and key != folded)
     values.extend(_numeric_equivalents(term))

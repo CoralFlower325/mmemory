@@ -17,7 +17,8 @@ def find_merge_groups(db_conn: sqlite3.Connection,
                       db_conn.execute("PRAGMA table_info(memories)").fetchall())
     has_kind = any(row[1] == 'kind' for row in
                    db_conn.execute("PRAGMA table_info(memories)").fetchall())
-    project = None if project_key is None else str(project_key).strip()
+    project = (None if project_key is None
+               else engine.normalize_project_key(project_key))
     if has_project:
         where = "WHERE status = 'active'"
         params: list = []
@@ -162,23 +163,19 @@ def apply_merge(group: dict, merged_memories: list[dict],
     # 空组同样要挡：max() 对空序列抛 ValueError，且 IN () 是语法错误。
     if not group.get('memories'):
         return
-    # 五字段类型、长度和元数据在变更来源之前校验。
+    # 模型只允许产出五字段；来源元数据由锁定后的旧记录继承。
     for m in merged_memories:
+        if not isinstance(m, dict):
+            return {'merged': False, 'reason': '合并输出必须是对象'}
         if any(not isinstance(m.get(k, ''), str) for k in engine.CONTENT_FIELDS):
             return {'merged': False, 'reason': '合并输出的五字段必须是字符串'}
-        ok, reason, _ = engine_mmemory_filter.validate_fields(
-            *(m.get(k, '') for k in engine.CONTENT_FIELDS),
-            kind=m.get('kind', group.get('kind', 'experience')))
-        if not ok:
-            return {'merged': False, 'reason': f'合并输出校验失败：{reason}'}
-        metadata_ok, metadata_reason, _ = engine._normalize_metadata(
-            m.get('kind', 'experience'), m.get('source_ref', ''),
-            m.get('origin', ''), m.get('verification', 'unverified'),
-            m.get('valid_from', ''), m.get('valid_until', ''),
-        )
-        if not metadata_ok:
-            return {'merged': False,
-                    'reason': f'合并输出元数据无效：{metadata_reason}'}
+        forbidden = {'kind', 'source_ref', 'origin', 'verification',
+                     'valid_from', 'valid_until'} & set(m)
+        if forbidden:
+            return {
+                'merged': False,
+                'reason': 'Dream 输出只接受五字段；元数据必须从来源继承',
+            }
 
     # 与 engine 的写路径共用同一把连接锁：共享连接时多线程会交错提交对方事务
     with engine.conn_lock(db_conn):
@@ -217,22 +214,55 @@ def _apply_merge_locked(group: dict, merged_memories: list[dict],
         inherited_verification = ('disputed' if 'disputed' in verifications else
                                   'unverified' if 'unverified' in verifications else
                                   'verified')
-        inherited_from = min(
-            (row.get('valid_from') for row in source_rows
-             if row.get('valid_from')), default='')
-        until_values = [row.get('valid_until') or '' for row in source_rows]
-        inherited_until = min((value for value in until_values if value), default='')
-        inherited_sources = ', '.join(
-            str(row.get('source_ref') or f'memory:{row["id"]}')
-            for row in source_rows)
+        try:
+            from_values = [engine._parse_temporal(row['valid_from'])
+                           for row in source_rows if row.get('valid_from')]
+            until_values = [engine._parse_temporal(
+                row['valid_until'], end_of_day=True)
+                for row in source_rows if row.get('valid_until')]
+            inherited_from = engine._format_utc(min(from_values)) if from_values else ''
+            inherited_until = engine._format_utc(min(until_values)) if until_values else ''
+        except ValueError as exc:
+            return {'merged': False, 'reason': f'来源有效期无效：{exc}'}
+        inherited_sources = f'dream-merge:{",".join(map(str, old_ids))}'
+        if len(inherited_sources) > 500:
+            inherited_sources = inherited_sources[:497] + '...'
 
-        # 对比五字段、项目、状态及固定标签；动态使用元数据从当前行继承。
+        # group 快照必须覆盖正文、类型和元数据，避免校验依据与最终插入脱节。
         current_by_id = {row['id']: row for row in source_rows}
         snapshot_fields = (*engine.CONTENT_FIELDS, 'project_key', 'status',
-                           'tags_domain', 'tags_tool', 'tags_action')
+                           'revision', 'kind', 'verification', 'source_ref',
+                           'origin', 'valid_from', 'valid_until')
         if any(old.get(field) != current_by_id[old['id']].get(field)
                for old in group['memories'] for field in snapshot_fields):
-            return
+            return {'merged': False, 'reason': 'Dream 来源已变化，请重新生成候选'}
+
+        for m in merged_memories:
+            ok, reason, _ = engine_mmemory_filter.validate_fields(
+                *(m.get(k, '') for k in engine.CONTENT_FIELDS),
+                kind=source_kind)
+            if not ok:
+                return {'merged': False,
+                        'reason': f'合并输出校验失败：{reason}'}
+
+        active_rows = db_conn.execute("""
+            SELECT id, goal FROM memories
+            WHERE status='active' AND project_key=?
+        """, (project_key,)).fetchall()
+        existing = {
+            engine_mmemory_filter._norm_goal(row['goal']): row['id']
+            for row in active_rows if row['id'] not in old_ids
+        }
+        output_goals = set()
+        for m in merged_memories:
+            normalized = engine_mmemory_filter._norm_goal(m['goal'])
+            if normalized in existing:
+                return {'merged': False,
+                        'reason': f'合并输出与 active 记忆 #{existing[normalized]} 精确重复'}
+            if normalized in output_goals:
+                return {'merged': False,
+                        'reason': '同一批 Dream 输出存在重复目标'}
+            output_goals.add(normalized)
 
         def _num(value, default):
             try:
@@ -255,17 +285,18 @@ def _apply_merge_locked(group: dict, merged_memories: list[dict],
             return
 
         # 插入新记录（继承权重和使用次数）
+        created_ids = []
         for index, m in enumerate(merged_memories):
             inherited_use = use_base + (1 if index < use_remainder else 0)
             fields = tuple(m.get(field, '') for field in engine.CONTENT_FIELDS)
             tags = engine.generate_tags(*fields)
             metadata_ok, metadata_reason, metadata = engine._normalize_metadata(
-                m.get('kind', source_kind),
-                m.get('source_ref', inherited_sources),
-                m.get('origin', 'dream-merge'),
-                m.get('verification', inherited_verification),
-                m.get('valid_from', inherited_from),
-                m.get('valid_until', inherited_until),
+                source_kind,
+                inherited_sources,
+                'dream-merge',
+                inherited_verification,
+                inherited_from,
+                inherited_until,
             )
             if not metadata_ok:
                 raise ValueError(metadata_reason)
@@ -284,6 +315,7 @@ def _apply_merge_locked(group: dict, merged_memories: list[dict],
                   inherited_use, metadata['kind'], metadata['source_ref'],
                   metadata['origin'], metadata['verification'],
                   metadata['valid_from'], metadata['valid_until'], search_text))
+            created_ids.append(cur.lastrowid)
 
             # 合并是维护：继承真实历史时间，重置新权重的衰减基线。
             db_conn.execute("UPDATE memories SET created_at=COALESCE(?, created_at), last_used=COALESCE(?, last_used) WHERE id=?",
@@ -302,6 +334,7 @@ def _apply_merge_locked(group: dict, merged_memories: list[dict],
         sp_open = False
         if own_tx:
             db_conn.commit()
+        return {'merged': True, 'memory_ids': created_ids}
     except Exception:
         # 先回滚到 savepoint（撤销归档与新写入），再按所有权决定是否
         # 回滚整个事务；调用方事务不受影响。

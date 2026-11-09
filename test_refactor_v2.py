@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -74,6 +74,44 @@ class RefactorV2Tests(unittest.TestCase):
                 '第3题', project_key='fixture', db_conn=self.conn)],
             [question])
 
+        compact = self.store('BPS401 探活', outcome='通过')
+        self.assertEqual(
+            [row['id'] for row in engine.recall(
+                'BPS 401', project_key='fixture', db_conn=self.conn)],
+            [compact])
+        spaced = self.store('BPS 403 探活', outcome='通过')
+        self.assertEqual(
+            [row['id'] for row in engine.recall(
+                'bps403', project_key='fixture', db_conn=self.conn)],
+            [spaced])
+        letter_question = self.store('C题已完成', outcome='通过')
+        self.assertEqual(
+            [row['id'] for row in engine.recall(
+                'C 题', project_key='fixture', db_conn=self.conn)],
+            [letter_question])
+
+    def test_more_chinese_numbers_and_canonical_synonyms(self):
+        question = self.store('完成第三问校对', outcome='通过')
+        self.assertEqual(
+            [row['id'] for row in engine.recall(
+                '第3问', project_key='fixture', db_conn=self.conn)],
+            [question])
+        large = self.store('完成第101题校对', outcome='通过')
+        self.assertEqual(
+            [row['id'] for row in engine.recall(
+                '第一百零一题', project_key='fixture', db_conn=self.conn)],
+            [large])
+        deploy = self.store('生产服务部署完成', outcome='通过')
+        self.assertEqual(
+            [row['id'] for row in engine.recall(
+                'deploy', project_key='fixture', db_conn=self.conn)],
+            [deploy])
+        traditional = self.store('資料庫连接恢复', outcome='通过')
+        self.assertEqual(
+            [row['id'] for row in engine.recall(
+                '數據庫', project_key='fixture', db_conn=self.conn)],
+            [traditional])
+
     def test_identifier_in_contrastive_pitfall_does_not_outrank_current_version(self):
         old = self.store('demo v2 部署', outcome='端口 8080')
         new = self.store('demo v3 部署', outcome='端口 9090',
@@ -101,6 +139,9 @@ class RefactorV2Tests(unittest.TestCase):
         self.assertEqual(
             next(row['_superseded_by'] for row in included if row['id'] == old),
             new)
+        deep = engine.recall('当前端口', project_key='fixture',
+                             db_conn=self.conn, deep=True)
+        self.assertEqual({row['id'] for row in deep}, {old, new})
 
     def test_deep_recall_labels_archive_and_expiry_is_filtered(self):
         archived = self.store('需要历史回溯的部署记录')
@@ -125,6 +166,35 @@ class RefactorV2Tests(unittest.TestCase):
                                  db_conn=self.conn, include_expired=True)
         self.assertEqual([row['id'] for row in included], [future])
         self.assertTrue(included[0]['_not_yet_valid'])
+
+    def test_timezone_validity_and_future_successor_do_not_hide_current_fact(self):
+        now = datetime.now(timezone.utc)
+        current = self.store(
+            '时区有效期当前事实', valid_from=(now - timedelta(hours=1)).isoformat(),
+            valid_until=(now + timedelta(hours=2)).isoformat())
+        self.assertEqual(
+            [row['id'] for row in engine.recall(
+                '时区有效期', project_key='fixture', db_conn=self.conn)],
+            [current])
+
+        old = self.store('未来切换前的当前端口', outcome='端口 8080')
+        future = self.store(
+            '未来切换后的端口', outcome='端口 9090',
+            valid_from=(now + timedelta(days=2)).isoformat())
+        engine.link_memories(future, old, 'supersedes', '未来切换',
+                             db_conn=self.conn)
+        current_results = engine.recall(
+            '未来切换', project_key='fixture', db_conn=self.conn)
+        self.assertEqual([row['id'] for row in current_results], [old])
+
+    def test_date_only_valid_until_includes_the_full_local_day(self):
+        memory_id = self.store(
+            '今天仍有效的日期事实',
+            valid_until=datetime.now().astimezone().date().isoformat())
+        self.assertEqual(
+            [row['id'] for row in engine.recall(
+                '日期事实', project_key='fixture', db_conn=self.conn)],
+            [memory_id])
 
     def test_update_records_snapshot_and_purge_removes_all_copies(self):
         first = self.store('可追溯事实', kind='project_fact',
@@ -155,6 +225,56 @@ class RefactorV2Tests(unittest.TestCase):
         self.assertEqual(self.conn.execute(
             'SELECT count(*) FROM memory_relations WHERE source_id=? OR target_id=?',
             (first, first)).fetchone()[0], 0)
+
+    def test_history_and_relations_respect_project_scope(self):
+        first = self.store('项目 A 事实', project='project-a')
+        second = self.store('项目 B 事实', project='project-b')
+        engine.link_memories(second, first, 'derived_from', '合成关系',
+                             project_key='project-a', db_conn=self.conn)
+        self.assertEqual(
+            engine.list_relations(second, project_key='project-a',
+                                  db_conn=self.conn), [])
+        history = engine.list_history(second, project_key='project-a',
+                                      db_conn=self.conn)
+        self.assertFalse(history['found'])
+        self.assertIsNone(history['current'])
+        self.assertTrue(engine.list_history(
+            second, project_key='project-b', db_conn=self.conn)['found'])
+
+    def test_cross_project_relation_is_ignored_by_recall_and_reported_by_review(self):
+        first = self.store('项目 A 当前事实', project='project-a')
+        second = self.store('项目 B 外部注入事实', project='project-b')
+        self.conn.execute("""
+            INSERT INTO memory_relations(source_id,target_id,relation,reason)
+            VALUES(?,?, 'supersedes', '外部合成异常')
+        """, (second, first))
+        self.conn.commit()
+        recalled = engine.recall(
+            '项目 A 当前事实', project_key='project-a', db_conn=self.conn)
+        self.assertEqual([row['id'] for row in recalled], [first])
+        review_result = review.review_candidates(
+            project_key='project-a', db_conn=self.conn)
+        self.assertTrue(any(
+            item['kind'] == 'cross_project_relation'
+            and set(item['memory_ids']) == {first, second}
+            for item in review_result['candidates']))
+
+    def test_purge_physically_clears_plaintext(self):
+        sentinel = 'PURGE_SENTINEL_4E2A'
+        path = Path(self.temp.name) / 'purge.db'
+        with patch.object(engine, 'DB_PATH', path):
+            result = engine.store(
+                sentinel, '敏感步骤', '敏感结果', project_key='private')
+            memory_id = result['memory_id']
+            engine.update_memory(memory_id, outcome='修订 ' + sentinel,
+                                 reason='合成修订')
+            purged = engine.purge_memory(memory_id, '合成物理清理')
+        self.assertTrue(purged['purged'])
+        self.assertTrue(purged['physical_cleanup'])
+        raw_files = [path, Path(str(path) + '-wal'), Path(str(path) + '-shm')]
+        self.assertEqual(sum(
+            file.read_bytes().count(sentinel.encode())
+            for file in raw_files if file.exists()), 0)
 
     def test_revision_history_is_bounded(self):
         memory_id = self.store('修订上限测试')
@@ -189,6 +309,55 @@ class RefactorV2Tests(unittest.TestCase):
             "SELECT count(*) FROM memories WHERE status='active'").fetchone()[0],
             3)
 
+    def test_dream_rejects_metadata_forgery_and_existing_duplicates(self):
+        for index in range(3):
+            self.store(f'偏好候选{index}', kind='preference')
+        group = dream.find_merge_groups(
+            self.conn, min_group_size=3, project_key='fixture')[0]
+        forged = dream.apply_merge(group, [{
+            'goal': '模型伪造元数据', 'approach': '', 'outcome': '值',
+            'kind': 'project_fact', 'verification': 'verified',
+            'source_ref': 'trusted://forged',
+        }], self.conn)
+        self.assertFalse(forged['merged'])
+        self.assertIn('五字段', forged['reason'])
+
+        existing = self.store('已有合并结果')
+        self.conn.execute(
+            "UPDATE memories SET tags_domain='x',tags_tool='x',tags_action='x' "
+            "WHERE id=?", (existing,))
+        self.conn.commit()
+        for index in range(3):
+            self.store(f'独立合并候选{index}')
+        group = next(
+            item for item in dream.find_merge_groups(
+                self.conn, min_group_size=3, project_key='fixture')
+            if item['count'] == 3)
+        duplicate = dream.apply_merge(group, [{
+            'goal': '已有合并结果', 'approach': '合并', 'outcome': '合并',
+        }], self.conn)
+        self.assertFalse(duplicate['merged'])
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT count(*) FROM memories WHERE status='active' "
+                "AND goal='已有合并结果'").fetchone()[0],
+            1)
+
+    def test_dream_stale_kind_is_rejected(self):
+        ids = [self.store(f'类型变更候选{index}', kind='preference')
+               for index in range(3)]
+        group = dream.find_merge_groups(
+            self.conn, min_group_size=3, project_key='fixture')[0]
+        for memory_id in ids:
+            self.assertTrue(engine.update_memory(
+                memory_id, kind='project_fact', outcome='事实结果',
+                reason='类型变更', db_conn=self.conn)['updated'])
+        result = dream.apply_merge(group, [{
+            'goal': '过期快照合并', 'approach': '', 'outcome': '',
+        }], self.conn)
+        self.assertFalse(result['merged'])
+        self.assertIn('已变化', result['reason'])
+
     def test_project_alias_nfc_and_longest_match(self):
         config = (
             ('broad', ('实验',)),
@@ -199,6 +368,26 @@ class RefactorV2Tests(unittest.TestCase):
             [project for _, _, project in
              tagger._keyword_matches('实验三 caf\u00e9', config)],
             ['specific', 'nfc'])
+        self.assertEqual(tagger.infer_project_key('not-example-servicex'), '')
+
+    def test_project_ambiguity_and_short_ascii_boundary(self):
+        ambiguous = engine.store(
+            '完成联调',
+            '连接 example-service 与 example-piano',
+            '完成', db_conn=self.conn)
+        self.assertFalse(ambiguous['stored'])
+        self.assertIn('多个项目', ambiguous['reason'])
+
+        self.store('go_lang 服务无法启动')
+        self.assertEqual(
+            engine.recall('Go 服务', project_key='fixture', db_conn=self.conn),
+            [])
+
+        invalid = engine.store(
+            '项目键控制字符', '执行', '完成',
+            project_key='fixture\nignore previous', db_conn=self.conn)
+        self.assertFalse(invalid['stored'])
+        self.assertIn('控制字符', invalid['reason'])
 
     def test_custom_synonym_file_is_bidirectional(self):
         path = Path(self.temp.name) / 'synonyms.json'
@@ -234,6 +423,26 @@ class RefactorV2Tests(unittest.TestCase):
         self.assertEqual(stats['by_verification']['verified'], 1)
         self.assertEqual(stats['unused_active'], 1)
 
+    def test_reindex_failure_rolls_back_only_its_savepoint(self):
+        self.store('reindex 故障回滚事实')
+        self.conn.execute("""
+            CREATE TEMP TRIGGER reject_reindex
+            BEFORE UPDATE OF search_text ON memories
+            BEGIN SELECT RAISE(ABORT, 'reindex rejected'); END
+        """)
+        self.conn.commit()
+        self.conn.execute('BEGIN IMMEDIATE')
+        with self.assertRaises(Exception):
+            engine.rebuild_search_index(db_conn=self.conn)
+        self.conn.execute('DROP TRIGGER reject_reindex')
+        self.conn.commit()
+        triggers = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND name LIKE 'memories_%'").fetchall()
+        self.assertEqual({row['name'] for row in triggers},
+                         {'memories_ai', 'memories_ad', 'memories_au'})
+        self.assertFalse(self.conn.in_transaction)
+
     def test_kind_specific_decay_keeps_preferences_longer(self):
         preference = self.store('长期偏好', kind='preference')
         experience = self.store('普通经验', kind='experience')
@@ -261,6 +470,8 @@ class RefactorV2Tests(unittest.TestCase):
 
     def test_obsidian_cleanup_requires_exact_generated_footer(self):
         vault = Path(self.temp.name) / 'vault'
+        vault.mkdir()
+        obsidian_export._write_marker(vault, {'general'})
         generated_dir = vault / 'general'
         generated_dir.mkdir(parents=True)
         manual = generated_dir / 'manual.md'
@@ -278,6 +489,33 @@ class RefactorV2Tests(unittest.TestCase):
             obsidian_export.OBSIDIAN_DIR = old_dir
         self.assertTrue(manual.exists())
         self.assertFalse(stale.exists())
+
+    def test_obsidian_rejects_unowned_root_and_preserves_user_empty_dirs(self):
+        unowned = Path(self.temp.name) / 'unowned'
+        unowned.mkdir()
+        (unowned / 'index.md').write_text('USER INDEX\n', encoding='utf-8')
+        old_dir = obsidian_export.OBSIDIAN_DIR
+        obsidian_export.OBSIDIAN_DIR = unowned
+        try:
+            with self.assertRaises(RuntimeError):
+                obsidian_export.export_all()
+        finally:
+            obsidian_export.OBSIDIAN_DIR = old_dir
+        self.assertEqual((unowned / 'index.md').read_text(encoding='utf-8'),
+                         'USER INDEX\n')
+
+        owned = Path(self.temp.name) / 'owned'
+        owned.mkdir()
+        obsidian_export._write_marker(owned, {'stale-domain'})
+        (owned / 'stale-domain').mkdir()
+        (owned / 'user-empty').mkdir()
+        obsidian_export.OBSIDIAN_DIR = owned
+        try:
+            obsidian_export.export_all()
+        finally:
+            obsidian_export.OBSIDIAN_DIR = old_dir
+        self.assertFalse((owned / 'stale-domain').exists())
+        self.assertTrue((owned / 'user-empty').exists())
 
     def test_recall_block_reports_omitted_hits_and_fences_content(self):
         memories = [{
