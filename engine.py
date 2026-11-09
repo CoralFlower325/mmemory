@@ -77,7 +77,7 @@ def _validate_project_key(project_key: str) -> str:
     for char in value:
         category = unicodedata.category(char)
         if char in '\r\n' or ord(char) < 32 or 127 <= ord(char) < 160 or category in (
-                'Cc', 'Cf', 'Cs'):
+                'Cc', 'Cf', 'Cs', 'Zl', 'Zp'):
             raise ValueError('project_key 不能包含换行或控制字符')
     return value
 
@@ -489,10 +489,13 @@ def _parse_temporal(value: str, *, end_of_day: bool = False) -> datetime:
     text = str(value or '').strip()
     date_only = bool(re.fullmatch(r'\d{4}-\d{2}-\d{2}', text))
     parsed = datetime.fromisoformat(text.replace('Z', '+00:00'))
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
     if end_of_day and date_only:
         parsed = parsed.replace(hour=23, minute=59, second=59)
+    if parsed.tzinfo is None:
+        # time.mktime applies the local timezone rules for the target date,
+        # including DST changes, rather than freezing the current UTC offset.
+        timestamp = time.mktime(parsed.timetuple())
+        parsed = datetime.fromtimestamp(timestamp, timezone.utc)
     return parsed.astimezone(timezone.utc)
 
 
@@ -1129,9 +1132,22 @@ def list_relations(memory_id: int, *, project_key: Optional[str] = None,
             (memory_id, *params)).fetchone()
         if visible is None:
             return []
-        rows = conn.execute('''SELECT * FROM memory_relations WHERE source_id=? OR target_id=?
-                               ORDER BY created_at,source_id,target_id,relation''',
-                            (memory_id, memory_id)).fetchall()
+        if project_key is None:
+            rows = conn.execute(
+                'SELECT * FROM memory_relations WHERE source_id=? OR target_id=? '
+                'ORDER BY created_at,source_id,target_id,relation',
+                (memory_id, memory_id)).fetchall()
+        else:
+            normalized = _validate_project_key(project_key)
+            rows = conn.execute("""
+                SELECT r.* FROM memory_relations r
+                JOIN memories source ON source.id=r.source_id
+                JOIN memories target ON target.id=r.target_id
+                WHERE (r.source_id=? OR r.target_id=?)
+                  AND COALESCE(source.project_key,'')=?
+                  AND COALESCE(target.project_key,'')=?
+                ORDER BY r.created_at,r.source_id,r.target_id,r.relation
+            """, (memory_id, memory_id, normalized, normalized)).fetchall()
         return [dict(row) for row in rows]
     finally:
         if own_conn:
@@ -1451,18 +1467,21 @@ def _recall_locked(conn, own_conn, message, limit, reinforce, project_key,
         required_groups = [_term_group(term) for term in required_terms]
         identity_groups = [
             group for group in required_groups
-            if any(
-                re.fullmatch(r'(?i)v\d+|[a-z]*\d{3,}[a-z0-9_-]*', term)
-                for term in group)
+            if any(_is_identity_term(term) for term in group)
         ]
         for mid, row in candidates.items():
             body = ' '.join(str(row.get(field) or '') for field in CONTENT_FIELDS)
-            core_body = ' '.join(str(row.get(field) or '') for field in
-                                 ('goal', 'outcome', 'success_key'))
+            core_body = _strip_contrastive_identifiers(' '.join(
+                str(row.get(field) or '') for field in
+                ('goal', 'outcome', 'success_key')))
             group_hits = [_term_group_in_text(group, body)
                           for group in required_groups]
-            identity_hits = [_term_group_in_text(group, core_body)
-                             for group in identity_groups]
+            goal_text = _strip_contrastive_identifiers(row.get('goal'))
+            identity_hits = [
+                _identity_group_in_text(group, goal_text) * 2
+                + _identity_group_in_text(group, core_body)
+                for group in identity_groups
+            ]
             required_hits[mid] = sum(group_hits) + sum(identity_hits)
             hits[mid] = sum(_term_in_text(term, body) for term in ranking_terms)
             matched_chars[mid] = sum(len(term) for term in ranking_terms
@@ -1509,6 +1528,7 @@ def _recall_locked(conn, own_conn, message, limit, reinforce, project_key,
             group for group in required_groups
             if any(term.isascii() and len(term) <= 3 for term in group)
         ]
+        mandatory_groups = list(dict.fromkeys((*short_groups, *identity_groups)))
         relevant = []
         for row in candidates.values():
             body = ' '.join(str(row.get(field) or '') for field in CONTENT_FIELDS)
@@ -1516,7 +1536,11 @@ def _recall_locked(conn, own_conn, message, limit, reinforce, project_key,
                 continue
             # 短标识（如 Go、API、401）必须全部命中，避免共享中文词把
             # Django/Google 或相邻版本带进来；长词仍可单独召回。
-            if any(not _term_group_in_text(group, body) for group in short_groups):
+            if any(
+                    not (_identity_group_in_text(group, body)
+                         if group in identity_groups
+                         else _term_group_in_text(group, body))
+                    for group in mandatory_groups):
                 continue
             if (row['id'] in superseded_by
                     and not (include_superseded or deep)):
@@ -1539,6 +1563,7 @@ def _recall_locked(conn, own_conn, message, limit, reinforce, project_key,
             'query_terms': ranking_terms,
             'required_terms': required_terms,
             'required_short_terms': [group[0] for group in short_groups],
+            'required_identity_terms': [group[0] for group in identity_groups],
             'required_alternatives': [list(group) for group in required_groups],
             'tags': tags,
             'deep': bool(deep),
@@ -1662,6 +1687,43 @@ def _clean_query_token(token: str) -> str:
     return (token or '').strip().strip('?!.,;:，。；：、')
 
 
+_IDENTIFIER_PATTERN = r'[A-Za-z]*\d+(?:\.\d+)*(?:[A-Za-z0-9._-]*)'
+
+
+def _is_identity_term(term: str) -> bool:
+    return re.fullmatch(
+        r'(?i)v\d+(?:\.\d+)*|\d+\.\d+(?:\.\d+)*|'
+        r'[a-z]*\d{3,}[a-z0-9._-]*|'
+        r'[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+',
+        term or '') is not None
+
+
+def _strip_contrastive_identifiers(text: str) -> str:
+    """移除对比句里的旧标识，避免把“从 v2 升到 v3”当成当前 v2 事实。"""
+    value = str(text or '')
+    patterns = (
+        (rf'(?:从|由)\s*({_IDENTIFIER_PATTERN})\s*'
+         rf'(?:升级到|升到|迁移到|改为|变成)\s*({_IDENTIFIER_PATTERN})',
+         r'\2'),
+        (rf'\bfrom\s+({_IDENTIFIER_PATTERN})\s+to\s+({_IDENTIFIER_PATTERN})\b',
+         r'\2'),
+        (rf'({_IDENTIFIER_PATTERN})\s*(?:->|→)\s*({_IDENTIFIER_PATTERN})',
+         r'\2'),
+        (rf'(?:旧版|旧|原来的|原)\s*({_IDENTIFIER_PATTERN})',
+         '旧标识'),
+        (rf'(?:与|和|跟|相比|较)\s*({_IDENTIFIER_PATTERN})',
+         '对比标识'),
+        (rf'({_IDENTIFIER_PATTERN})\s*(?:与|和|跟)\s*'
+         rf'({_IDENTIFIER_PATTERN})\s*(?:不兼容|不同|冲突|相比)',
+         r'\1 与 对比标识'),
+        (rf'({_IDENTIFIER_PATTERN})\s+vs\.?\s+({_IDENTIFIER_PATTERN})',
+         r'\1 vs 对比标识'),
+    )
+    for pattern, replacement in patterns:
+        value = re.sub(pattern, replacement, value, flags=re.IGNORECASE)
+    return value
+
+
 def _query_terms(query: str, *, include_generic: bool = False,
                  max_terms: Optional[int] = None) -> list[str]:
     import jieba
@@ -1684,15 +1746,19 @@ def _query_terms(query: str, *, include_generic: bool = False,
             terms.append(token)
 
     # 章节编号与单字母题号是有意义标识，必须在 jieba 把 A题 拆成 A/题 前提取。
+    for number, unit in re.findall(
+            r'第\s*([0-9一二三四五六七八九十百千零〇两]+)\s*([章节问题])',
+            query or ''):
+        add('第' + number + unit)
+    for token in re.findall(r'(?i)\bv\d+(?:\.\d+)+\b|\b\d+\.\d+(?:\.\d+)*\b',
+                            query or ''):
+        add(token)
     for token in re.findall(
             r'(?:第[0-9一二三四五六七八九十百千零〇两]+[章节问题])+|(?:[A-Za-z][题卷章节])',
             query or ''):
         add(token)
     for letter, unit in re.findall(r'(?i)\b([A-Za-z])\s+([题卷章节])\b', query or ''):
         add(letter + unit)
-    for prefix, digits in re.findall(
-            r'(?i)\b([A-Za-z]{2,8})\s+(\d{3,})\b', query or ''):
-        add(prefix + digits)
     for chunk in re.findall(r'[\u4e00-\u9fff]+|[^\s\u4e00-\u9fff]+', query or ''):
         tokens = jieba.cut(chunk) if re.search(r'[\u4e00-\u9fff]', chunk) else [chunk]
         for token in tokens:
@@ -1748,12 +1814,35 @@ def _term_group_in_text(group: tuple[str, ...], text: str) -> bool:
     return any(_term_in_text(term, text) for term in group)
 
 
+def _identity_group_in_text(group: tuple[str, ...], text: str) -> bool:
+    if _term_group_in_text(group, text):
+        return True
+    for term in group:
+        match = re.fullmatch(r'([A-Za-z]{1,12})(\d{3,})', term)
+        if match and all(_term_in_text(part, text)
+                         for part in match.groups()):
+            return True
+    return False
+
+
 def _term_in_text(term: str, text: str) -> bool:
     """正文命中检查；ASCII 标识按词边界，避免 Go 命中 Django/Google。"""
     folded_term = unicodedata.normalize('NFC', term or '').casefold()
     folded_text = unicodedata.normalize('NFC', text or '').casefold()
     if folded_term.isascii():
-        boundary_word = 'a-z0-9_-' if len(folded_term) <= 2 or '-' in folded_term else 'a-z0-9-'
+        compact = re.fullmatch(r'([a-z]{1,12})(\d{3,})', folded_term)
+        if compact and re.search(
+                rf'(?<![a-z0-9_-]){re.escape(compact.group(1))}\s+'
+                rf'{re.escape(compact.group(2))}(?![a-z0-9_-])',
+                folded_text):
+            return True
+        reverse = re.fullmatch(r'(\d{3,})([a-z]{1,12})', folded_term)
+        if reverse and re.search(
+                rf'(?<![a-z0-9_-]){re.escape(reverse.group(1))}\s+'
+                rf'{re.escape(reverse.group(2))}(?![a-z0-9_-])',
+                folded_text):
+            return True
+        boundary_word = 'a-z0-9-' if '_' in folded_term else 'a-z0-9_-'
         pattern = (
             rf'(?<![{boundary_word}]){re.escape(folded_term)}'
             rf'(?![{boundary_word}])'
@@ -2154,14 +2243,16 @@ def format_memory_summary(m: dict, index: int = 0) -> str:
     project = _clip_text(m.get('project_key'), 120)
     scope = f'[{project}] ' if project else ''
     flags = []
+    if m.get('kind') and m.get('kind') != 'experience':
+        flags.append(_clean_display(m.get('kind')))
+        flags.append(_clean_display(
+            m.get('verification') or 'unverified'))
+    elif m.get('verification') == 'disputed':
+        flags.append('disputed')
     if m.get('status') == 'archived':
         flags.append('archived')
     if m.get('protected'):
         flags.append('protected')
-    if m.get('kind') and m.get('kind') != 'experience':
-        flags.append(str(m['kind']))
-    if m.get('verification') == 'disputed':
-        flags.append('disputed')
     if m.get('_superseded_by'):
         flags.append(f"superseded-by:#{m['_superseded_by']}")
     if m.get('_expired'):
@@ -2211,7 +2302,7 @@ def _clean_display(text) -> str:
     chars = []
     for char in value:
         category = unicodedata.category(char)
-        chars.append(' ' if category in ('Cc', 'Cf', 'Cs') else char)
+        chars.append(' ' if category in ('Cc', 'Cf', 'Cs', 'Zl', 'Zp') else char)
     return ' '.join(''.join(chars).split())
 
 
@@ -2225,7 +2316,7 @@ def _clip_text(text, limit: int) -> str:
 
 def _clip_lesson(text, limit: int = 180) -> str:
     """保留长踩坑正文的首尾，尽量同时留下失败信号和最终解法。"""
-    value = ' '.join(str(text or '').split())
+    value = _clean_display(text)
     if len(value) <= limit:
         return value
     head = max(1, int(limit * 0.58))
@@ -2238,6 +2329,12 @@ def format_recall_context(m: dict, index: int = 0) -> str:
     project = _clean_display(m.get('project_key'))
     scope = f'[{project}] ' if project else ''
     flags = []
+    if m.get('kind') and m.get('kind') != 'experience':
+        flags.append(_clean_display(m.get('kind')))
+        flags.append(_clean_display(
+            m.get('verification') or 'unverified'))
+    elif m.get('verification') == 'disputed':
+        flags.append('disputed')
     if m.get('status') == 'archived':
         flags.append('archived')
     if m.get('_superseded_by'):

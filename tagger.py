@@ -486,7 +486,7 @@ def _numeric_equivalents(term: str) -> tuple[str, ...]:
     if match:
         value = int(match.group(1))
         return (f'第{_format_small_chinese_number(value)}{match.group(2)}',)
-    match = re.fullmatch(r'第([零〇一二两三四五六七八九十百]+)([题卷章节问])', term)
+    match = re.fullmatch(r'第([零〇一二两三四五六七八九十百千]+)([题卷章节问])', term)
     if match:
         value = _parse_small_chinese_number(match.group(1))
         if value is not None:

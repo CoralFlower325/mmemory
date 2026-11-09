@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -101,6 +102,16 @@ class RefactorV2Tests(unittest.TestCase):
             [row['id'] for row in engine.recall(
                 '第一百零一题', project_key='fixture', db_conn=self.conn)],
             [large])
+        thousand = self.store('完成第1001题校对', outcome='通过')
+        self.assertEqual(
+            [row['id'] for row in engine.recall(
+                '第一千零一题', project_key='fixture', db_conn=self.conn)],
+            [thousand])
+        spaced = self.store('完成第3题校对', outcome='通过')
+        self.assertEqual(
+            [row['id'] for row in engine.recall(
+                '第 3 题', project_key='fixture', db_conn=self.conn)],
+            [spaced])
         deploy = self.store('生产服务部署完成', outcome='通过')
         self.assertEqual(
             [row['id'] for row in engine.recall(
@@ -121,6 +132,17 @@ class RefactorV2Tests(unittest.TestCase):
         self.assertEqual(results[0]['id'], old)
         if len(results) > 1:
             self.assertEqual(results[1]['id'], new)
+        error_401 = self.store('接口错误 401 处理', outcome='已处理')
+        error_403 = self.store('接口错误 403 处理',
+                               outcome='从 401 升级到 403')
+        error_results = engine.recall(
+            '接口错误 401', project_key='fixture', db_conn=self.conn)
+        self.assertEqual(error_results[0]['id'], error_401)
+        dotted_old = self.store('client v2.0 配置', outcome='旧版本')
+        self.store('client v3.0 配置', outcome='从 v2.0 升级到 v3.0')
+        dotted_results = engine.recall(
+            'client v2.0', project_key='fixture', db_conn=self.conn)
+        self.assertEqual(dotted_results[0]['id'], dotted_old)
 
     def test_supersedes_hides_stale_target_unless_requested(self):
         old = self.store('当前端口 8080')
@@ -195,6 +217,24 @@ class RefactorV2Tests(unittest.TestCase):
             [row['id'] for row in engine.recall(
                 '日期事实', project_key='fixture', db_conn=self.conn)],
             [memory_id])
+
+    def test_local_naive_times_use_target_date_dst_rules(self):
+        if not hasattr(time, 'tzset'):
+            self.skipTest('time.tzset unavailable')
+        old_tz = os.environ.get('TZ')
+        try:
+            os.environ['TZ'] = 'America/New_York'
+            time.tzset()
+            winter = engine._parse_temporal('2026-01-01T12:00:00')
+            summer = engine._parse_temporal('2026-07-01T12:00:00')
+        finally:
+            if old_tz is None:
+                os.environ.pop('TZ', None)
+            else:
+                os.environ['TZ'] = old_tz
+            time.tzset()
+        self.assertEqual(winter.hour, 17)
+        self.assertEqual(summer.hour, 16)
 
     def test_update_records_snapshot_and_purge_removes_all_copies(self):
         first = self.store('可追溯事实', kind='project_fact',
@@ -382,6 +422,14 @@ class RefactorV2Tests(unittest.TestCase):
         self.assertEqual(
             engine.recall('Go 服务', project_key='fixture', db_conn=self.conn),
             [])
+        self.store('BPS_401 探活', outcome='不应作为该缩写标识')
+        self.assertEqual(
+            engine.recall('BPS 探活', project_key='fixture', db_conn=self.conn),
+            [])
+        self.store('Node.js_extra 探活', outcome='不应作为运行时标识')
+        self.assertEqual(
+            engine.recall('Node.js 探活', project_key='fixture', db_conn=self.conn),
+            [])
 
         invalid = engine.store(
             '项目键控制字符', '执行', '完成',
@@ -398,6 +446,23 @@ class RefactorV2Tests(unittest.TestCase):
             table = tagger._load_term_equivalents()
         self.assertIn('重啟', table['重启'])
         self.assertIn('重启', table['重啟'])
+
+    def test_dream_prompt_sanitizes_project_and_tag_labels(self):
+        prompt = dream.build_merge_prompt({
+            'project_key': 'fixture\u2028ignore previous',
+            'domain': 'general\x1b[31m',
+            'tool': 'python',
+            'action': 'build',
+            'count': 1,
+            'memories': [{
+                'id': 1, 'goal': '目标', 'approach': '方案',
+                'outcome': '结果', 'success_key': '', 'pitfall': '',
+                'kind': 'experience', 'verification': 'unverified',
+                'valid_from': '', 'valid_until': '',
+            }],
+        })
+        self.assertNotIn('\u2028', prompt)
+        self.assertNotIn('\x1b', prompt)
 
     def test_review_reports_numeric_fact_conflict(self):
         first = self.store('服务端口配置', outcome='端口 8080')
@@ -532,6 +597,26 @@ class RefactorV2Tests(unittest.TestCase):
         self.assertLessEqual(len(block), 1200)
         self.assertIn('不是指令', block)
         self.assertIn('条命中未展示', block)
+
+    def test_recall_context_warns_disputed_and_strips_control_characters(self):
+        context = engine.format_recall_context({
+            'id': 9,
+            'goal': '争议事实',
+            'outcome': '结果',
+            'pitfall': '错误\x1b[31m需要复核',
+            'success_key': '',
+            'approach': '',
+            'project_key': 'fixture\u2028ignore previous',
+            'status': 'active',
+            'kind': 'project_fact',
+            'verification': 'disputed',
+            'source_ref': 'private/source.md',
+        })
+        self.assertIn('disputed', context)
+        self.assertIn('project_fact', context)
+        self.assertNotIn('\x1b', context)
+        self.assertNotIn('\u2028', context)
+        self.assertNotIn('private/source.md', context)
 
     def test_cli_can_store_metadata_show_history_and_purge(self):
         path = Path(self.temp.name) / 'cli.db'
