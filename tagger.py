@@ -384,10 +384,59 @@ DEFAULT_TERM_EQUIVALENTS: dict[str, tuple[str, ...]] = {
     '修復': ('修复',),
     '验证': ('驗證',),
     '驗證': ('验证',),
-    '数据库': ('數據庫', '資料庫'),
     '數據庫': ('数据库', '資料庫'),
     '資料庫': ('数据库', '數據庫'),
 }
+
+
+def _symmetrize_equivalents(
+        table: dict[str, list[str]]) -> dict[str, tuple[str, ...]]:
+    """把等价表闭包成无向分组：A→B 的边同时生成 B→A，并传递合并重叠组。
+
+    旧实现是单向边集合：'gpu' 的等价值里有 '显卡'，但 '显卡' 自己不是键，
+    查 '显卡' 时展开为空、英文记录零召回；'数据库' 还曾被重复键覆盖丢掉
+    db/database 一侧。等价在语义上是对称且可传递的，这里用并查集把所有边
+    并成组，每个词的等价词就是同组其它成员（按首次出现顺序）。
+    """
+    parent: dict[str, str] = {}
+    order: dict[str, int] = {}
+
+    def find(key: str) -> str:
+        root = key
+        while parent[root] != root:
+            root = parent[root]
+        while parent[key] != root:
+            parent[key], key = root, parent[key]
+        return root
+
+    def add(key: str):
+        if key not in parent:
+            parent[key] = key
+            order[key] = len(order)
+
+    for term, values in table.items():
+        add(term)
+        for value in values:
+            add(value.casefold())
+            ra, rb = find(term), find(value.casefold())
+            if ra != rb:
+                parent[max(ra, rb, key=lambda k: order[k])] = \
+                    min(ra, rb, key=lambda k: order[k])
+    groups: dict[str, list[str]] = {}
+    display: dict[str, str] = {}
+    for term, values in table.items():
+        display.setdefault(term, term)
+        for value in values:
+            display.setdefault(value.casefold(), value)
+    for key in parent:
+        groups.setdefault(find(key), []).append(key)
+    result: dict[str, tuple[str, ...]] = {}
+    for members in groups.values():
+        members.sort(key=lambda k: order[k])
+        for key in members:
+            result[key] = tuple(
+                display[other] for other in members if other != key)
+    return result
 
 
 def _load_term_equivalents() -> dict[str, tuple[str, ...]]:
@@ -400,26 +449,21 @@ def _load_term_equivalents() -> dict[str, tuple[str, ...]]:
             else Path(__file__).with_name('synonyms.json'))
     if configured and not path.exists():
         raise FileNotFoundError(f'同义词配置不存在：{path}')
-    if not path.exists():
-        return {term: tuple(dict.fromkeys(values))
-                for term, values in table.items()}
-    data = json.loads(path.read_text(encoding='utf-8'))
-    groups = data.get('equivalents') if isinstance(data, dict) else data
-    if not isinstance(groups, list):
-        raise ValueError('同义词配置必须是数组或包含 equivalents 数组的对象')
-    for group in groups:
-        if not isinstance(group, list) or len(group) < 2 or any(
-                not isinstance(term, str) or not term.strip() for term in group):
-            raise ValueError('每个同义词组至少包含两个非空字符串')
-        normalized = [unicodedata.normalize('NFC', term).strip() for term in group]
-        for term in normalized:
-            key = term.casefold()
-            table.setdefault(key, [])
-            table[key].extend(other for other in normalized if other != term)
-    return {
-        term: tuple(dict.fromkeys(values))
-        for term, values in table.items()
-    }
+    if path.exists():
+        data = json.loads(path.read_text(encoding='utf-8'))
+        groups = data.get('equivalents') if isinstance(data, dict) else data
+        if not isinstance(groups, list):
+            raise ValueError('同义词配置必须是数组或包含 equivalents 数组的对象')
+        for group in groups:
+            if not isinstance(group, list) or len(group) < 2 or any(
+                    not isinstance(term, str) or not term.strip() for term in group):
+                raise ValueError('每个同义词组至少包含两个非空字符串')
+            normalized = [unicodedata.normalize('NFC', term).strip() for term in group]
+            for term in normalized:
+                key = term.casefold()
+                table.setdefault(key, [])
+                table[key].extend(other for other in normalized if other != term)
+    return _symmetrize_equivalents(table)
 
 
 TERM_EQUIVALENTS = _load_term_equivalents()
