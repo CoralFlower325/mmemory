@@ -2245,10 +2245,9 @@ def format_memory_summary(m: dict, index: int = 0) -> str:
     flags = []
     if m.get('kind') and m.get('kind') != 'experience':
         flags.append(_clean_display(m.get('kind')))
-        flags.append(_clean_display(
-            m.get('verification') or 'unverified'))
-    elif m.get('verification') == 'disputed':
-        flags.append('disputed')
+    verification = _clean_display(m.get('verification') or 'unverified')
+    if verification != 'verified':
+        flags.append(verification)
     if m.get('status') == 'archived':
         flags.append('archived')
     if m.get('protected'):
@@ -2331,10 +2330,9 @@ def format_recall_context(m: dict, index: int = 0) -> str:
     flags = []
     if m.get('kind') and m.get('kind') != 'experience':
         flags.append(_clean_display(m.get('kind')))
-        flags.append(_clean_display(
-            m.get('verification') or 'unverified'))
-    elif m.get('verification') == 'disputed':
-        flags.append('disputed')
+    verification = _clean_display(m.get('verification') or 'unverified')
+    if verification != 'verified':
+        flags.append(verification)
     if m.get('status') == 'archived':
         flags.append('archived')
     if m.get('_superseded_by'):
