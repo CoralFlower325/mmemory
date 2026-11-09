@@ -42,9 +42,9 @@ def cmd_store(args):
             print(json.dumps({'stored': False, 'memory_id': None, 'reason': reason},
                              ensure_ascii=False, indent=2))
             sys.exit(1)
-    elif args.memory_kind or args.task_state:
+    elif args.task_state:
         print(json.dumps({'stored': False, 'memory_id': None,
-                          'reason': '会话质量标注需要 --conversation 提供真实消息'},
+                          'reason': 'task-state 质量标注需要 --conversation 提供真实消息'},
                          ensure_ascii=False, indent=2))
         sys.exit(1)
     result = engine.store(
@@ -301,7 +301,7 @@ def main():
     p.add_argument('--include-superseded', action='store_true',
                    help='显示已被 supersedes 关系取代的旧记录并标注')
     p.add_argument('--include-expired', action='store_true',
-                   help='显示过了 valid_until 的历史记录并标注')
+                   help='显示有效区间之外的历史或未来记录并标注')
     p.add_argument('--project-key', default=None,
                    help='项目命名空间；省略时按查询文本推断')
 

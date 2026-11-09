@@ -15,6 +15,8 @@ def find_merge_groups(db_conn: sqlite3.Connection,
     """找出同一项目、领域、工具和操作下的合并候选；不判断语义重复。"""
     has_project = any(row[1] == 'project_key' for row in
                       db_conn.execute("PRAGMA table_info(memories)").fetchall())
+    has_kind = any(row[1] == 'kind' for row in
+                   db_conn.execute("PRAGMA table_info(memories)").fetchall())
     project = None if project_key is None else str(project_key).strip()
     if has_project:
         where = "WHERE status = 'active'"
@@ -26,14 +28,20 @@ def find_merge_groups(db_conn: sqlite3.Connection,
             # 未标项目的旧/共享记录不自动合并；它们缺少足够上下文，
             # 让 Dream 猜项目会重新制造跨项目污染。
             where += " AND project_key <> ''"
-        rows = db_conn.execute(f"""
-            SELECT project_key, tags_domain, tags_tool, tags_action, COUNT(*) as cnt
+        rows = db_conn.execute("""
+            SELECT project_key, tags_domain, tags_tool, tags_action,
+                   {kind_select} COUNT(*) as cnt
             FROM memories
             {where}
             GROUP BY project_key, tags_domain, tags_tool, tags_action
+                     {kind_group}
             HAVING cnt >= ?
             ORDER BY cnt DESC
-        """, (*params, min_group_size)).fetchall()
+        """.format(
+            kind_select='kind,' if has_kind else '',
+            kind_group=', kind' if has_kind else '',
+            where=where,
+        ), (*params, min_group_size)).fetchall()
     else:
         # 旧 schema 没有命名空间，只能保留旧分组行为。
         if project:
@@ -50,14 +58,17 @@ def find_merge_groups(db_conn: sqlite3.Connection,
     groups = []
     for r in rows:
         if has_project:
-            memories = db_conn.execute("""
+            kind_sql = ' AND kind = ?' if has_kind else ''
+            kind_params = (r['kind'],) if has_kind else ()
+            memories = db_conn.execute(f"""
                 SELECT * FROM memories
                 WHERE status = 'active'
                   AND project_key = ?
                   AND tags_domain = ? AND tags_tool = ? AND tags_action = ?
+                  {kind_sql}
                 ORDER BY weight DESC
             """, (r['project_key'], r['tags_domain'], r['tags_tool'],
-                  r['tags_action'])).fetchall()
+                  r['tags_action'], *kind_params)).fetchall()
         else:
             memories = db_conn.execute("""
                 SELECT * FROM memories
@@ -71,6 +82,7 @@ def find_merge_groups(db_conn: sqlite3.Connection,
             'tool': r['tags_tool'],
             'action': r['tags_action'],
             'count': r['cnt'],
+            'kind': r['kind'] if has_kind else 'experience',
             'low_specificity': r['tags_domain'] == 'general' and r['tags_tool'] == 'general',
             'memories': [dict(m) for m in memories],
         })

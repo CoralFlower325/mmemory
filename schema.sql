@@ -91,7 +91,8 @@ CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
     VALUES ('delete', old.id, old.search_text);
 END;
 
-CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE OF
+    goal, approach, outcome, success_key, pitfall, search_text ON memories BEGIN
     INSERT INTO memories_fts(memories_fts, rowid, search_text)
     VALUES ('delete', old.id, old.search_text);
     INSERT INTO memories_fts(rowid, search_text)

@@ -357,10 +357,45 @@ DEFAULT_TERM_EQUIVALENTS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _load_term_equivalents() -> dict[str, tuple[str, ...]]:
+    table = {
+        term.casefold(): list(values)
+        for term, values in DEFAULT_TERM_EQUIVALENTS.items()
+    }
+    configured = os.environ.get('MMEMORY_SYNONYMS_FILE')
+    path = (Path(configured).expanduser() if configured
+            else Path(__file__).with_name('synonyms.json'))
+    if configured and not path.exists():
+        raise FileNotFoundError(f'同义词配置不存在：{path}')
+    if not path.exists():
+        return {term: tuple(dict.fromkeys(values))
+                for term, values in table.items()}
+    data = json.loads(path.read_text(encoding='utf-8'))
+    groups = data.get('equivalents') if isinstance(data, dict) else data
+    if not isinstance(groups, list):
+        raise ValueError('同义词配置必须是数组或包含 equivalents 数组的对象')
+    for group in groups:
+        if not isinstance(group, list) or len(group) < 2 or any(
+                not isinstance(term, str) or not term.strip() for term in group):
+            raise ValueError('每个同义词组至少包含两个非空字符串')
+        normalized = [unicodedata.normalize('NFC', term).strip() for term in group]
+        for term in normalized:
+            key = term.casefold()
+            table.setdefault(key, [])
+            table[key].extend(other for other in normalized if other != term)
+    return {
+        term: tuple(dict.fromkeys(values))
+        for term, values in table.items()
+    }
+
+
+TERM_EQUIVALENTS = _load_term_equivalents()
+
+
 def search_term_equivalents(term: str) -> tuple[str, ...]:
     """返回查询词的可选等价写法；原词由调用方保留。"""
     folded = (term or '').casefold()
-    values = list(DEFAULT_TERM_EQUIVALENTS.get(folded, ()))
+    values = list(TERM_EQUIVALENTS.get(folded, ()))
     synonym_map = load_synonym_map()
     canonical = synonym_map.get(folded)
     if canonical:

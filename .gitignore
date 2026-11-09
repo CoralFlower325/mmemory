@@ -15,6 +15,7 @@ _legacy/
 .work/
 obsidian-export/
 projects.json
+synonyms.json
 
 # Installed-host integration tests stay with the local deployment
 test_adversarial_fixes_20261020.py

@@ -1,13 +1,19 @@
 """Schema v2, retrieval, relation, and history regressions on synthetic data."""
 
+import json
+import os
+import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import dream
 import engine
 import obsidian_export
+import review
 import tagger
 
 
@@ -99,6 +105,14 @@ class RefactorV2Tests(unittest.TestCase):
         self.assertEqual([row['id'] for row in included], [expired])
         self.assertTrue(included[0]['_expired'])
 
+        future = self.store('未来才生效的事实', valid_from='2099-01-01')
+        self.assertEqual(engine.recall('未来才生效', project_key='fixture',
+                                       db_conn=self.conn), [])
+        included = engine.recall('未来才生效', project_key='fixture',
+                                 db_conn=self.conn, include_expired=True)
+        self.assertEqual([row['id'] for row in included], [future])
+        self.assertTrue(included[0]['_not_yet_valid'])
+
     def test_update_records_snapshot_and_purge_removes_all_copies(self):
         first = self.store('可追溯事实', kind='project_fact',
                            source_ref='notes/design.md',
@@ -155,6 +169,28 @@ class RefactorV2Tests(unittest.TestCase):
              tagger._keyword_matches('实验三 caf\u00e9', config)],
             ['specific', 'nfc'])
 
+    def test_custom_synonym_file_is_bidirectional(self):
+        path = Path(self.temp.name) / 'synonyms.json'
+        path.write_text(json.dumps({
+            'equivalents': [['重启', '重啟', '重新启动']]
+        }, ensure_ascii=False), encoding='utf-8')
+        with patch.dict(os.environ, {'MMEMORY_SYNONYMS_FILE': str(path)}):
+            table = tagger._load_term_equivalents()
+        self.assertIn('重啟', table['重启'])
+        self.assertIn('重启', table['重啟'])
+
+    def test_review_reports_numeric_fact_conflict(self):
+        first = self.store('服务端口配置', outcome='端口 8080')
+        second = self.store('服务端口配置复核', outcome='端口 9090')
+        result = review.review_candidates(
+            project_key='fixture', db_conn=self.conn)
+        conflicts = [
+            item for item in result['candidates']
+            if item['kind'] == 'potential_conflict'
+        ]
+        self.assertTrue(any(set(item['memory_ids']) == {first, second}
+                            for item in conflicts))
+
     def test_reindex_repairs_deleted_fts_rows_and_stats_expose_health(self):
         self.store('健康统计事实', kind='preference', verification='verified')
         self.conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('delete-all')")
@@ -186,6 +222,93 @@ class RefactorV2Tests(unittest.TestCase):
             obsidian_export.OBSIDIAN_DIR = old_dir
         self.assertTrue(manual.exists())
         self.assertFalse(stale.exists())
+
+    def test_cli_can_store_metadata_show_history_and_purge(self):
+        path = Path(self.temp.name) / 'cli.db'
+        env = {**os.environ, 'MMEMORY_DB': str(path)}
+        store = subprocess.run([
+            sys.executable, 'cli.py', 'store',
+            '--goal', 'CLI 合成项目事实',
+            '--approach', '执行合成步骤',
+            '--outcome', '合成结果通过',
+            '--kind', 'project_fact',
+            '--verification', 'verified',
+            '--source-ref', 'docs/synthetic.md',
+            '--project-key', 'fixture',
+        ], cwd=Path(__file__).parent, env=env, text=True, capture_output=True)
+        self.assertEqual(store.returncode, 0, store.stderr)
+        memory_id = json.loads(store.stdout)['memory_id']
+        update = subprocess.run([
+            sys.executable, 'cli.py', 'update', str(memory_id),
+            '--outcome', '修订后的合成结果', '--reason', '合成修订',
+        ], cwd=Path(__file__).parent, env=env, text=True, capture_output=True)
+        self.assertEqual(update.returncode, 0, update.stderr)
+        history = subprocess.run([
+            sys.executable, 'cli.py', 'history', str(memory_id),
+        ], cwd=Path(__file__).parent, env=env, text=True, capture_output=True)
+        self.assertEqual(history.returncode, 0, history.stderr)
+        payload = json.loads(history.stdout)
+        self.assertEqual(payload['current']['kind'], 'project_fact')
+        self.assertEqual(payload['revisions'][0]['reason'], '合成修订')
+        purge = subprocess.run([
+            sys.executable, 'cli.py', 'purge', str(memory_id),
+            '--reason', '合成清理', '--yes',
+        ], cwd=Path(__file__).parent, env=env, text=True, capture_output=True)
+        self.assertEqual(purge.returncode, 0, purge.stderr)
+        self.assertTrue(json.loads(purge.stdout)['purged'])
+
+    def test_concurrent_first_open_upgrades_an_old_schema_once(self):
+        path = Path(self.temp.name) / 'legacy-race.db'
+        with sqlite3.connect(path) as conn:
+            conn.execute("""
+                CREATE TABLE memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    goal TEXT NOT NULL,
+                    approach TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    success_key TEXT DEFAULT '',
+                    pitfall TEXT DEFAULT '',
+                    tags_tool TEXT DEFAULT 'general',
+                    tags_domain TEXT DEFAULT 'general',
+                    tags_action TEXT DEFAULT 'general',
+                    tags_keywords TEXT DEFAULT '',
+                    weight REAL DEFAULT 1.0,
+                    use_count INTEGER DEFAULT 0,
+                    created_at TEXT DEFAULT (datetime('now', 'localtime')),
+                    last_used TEXT DEFAULT (datetime('now', 'localtime')),
+                    status TEXT DEFAULT 'active'
+                )
+            """)
+            conn.execute(
+                "INSERT INTO memories(goal,approach,outcome) VALUES(?,?,?)",
+                ('旧库并发迁移', '迁移', '通过'))
+        program = (
+            'import sys\n'
+            'import engine\n'
+            'c=engine.get_conn(sys.argv[1])\n'
+            'assert c.execute("PRAGMA user_version").fetchone()[0] == 2\n'
+            'c.close()\n'
+        )
+        processes = [
+            subprocess.Popen(
+                [sys.executable, '-c', program, str(path)],
+                cwd=Path(__file__).parent, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            for _ in range(8)
+        ]
+        failures = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=30)
+            if process.returncode != 0:
+                failures.append((process.returncode, stdout, stderr))
+        self.assertEqual(failures, [])
+        conn = engine.get_conn(str(path))
+        try:
+            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 2)
+            self.assertEqual(conn.execute(
+                'SELECT count(*) FROM memories').fetchone()[0], 1)
+        finally:
+            conn.close()
 
 
 if __name__ == '__main__':

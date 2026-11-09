@@ -174,6 +174,8 @@ def _ensure_healthy(conn: sqlite3.Connection):
     with _write_lock:
         if conn.in_transaction:
             conn.rollback()
+        if _schema_is_current(conn):
+            return
         tables = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         if 'memories' not in tables:
@@ -210,6 +212,38 @@ def _ensure_healthy(conn: sqlite3.Connection):
 
         if conn.in_transaction:
             conn.rollback()
+
+
+def _schema_is_current(conn: sqlite3.Connection) -> bool:
+    try:
+        if conn.execute('PRAGMA user_version').fetchone()[0] != CURRENT_SCHEMA_VERSION:
+            return False
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if not {'memories', 'memory_relations', 'memory_revisions',
+                'memories_fts'}.issubset(tables):
+            return False
+        columns = {r[1] for r in conn.execute(
+            'PRAGMA table_info(memories)').fetchall()}
+        if not {'search_text', 'revision', 'kind', 'source_ref', 'origin',
+                'verification', 'valid_from', 'valid_until'}.issubset(columns):
+            return False
+        if [r[1] for r in conn.execute(
+                'PRAGMA table_info(memories_fts)').fetchall()] != ['search_text']:
+            return False
+        triggers = {r[0]: (r[1] or '') for r in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='trigger'").fetchall()}
+        if not all(name in triggers and 'search_text' in triggers[name]
+                   for name, _ in _FTS_TRIGGER_DDL):
+            return False
+        if 'AFTER UPDATE OF' not in triggers.get('memories_au', ''):
+            return False
+        indexed = conn.execute(
+            'SELECT count(*) FROM memories_fts_docsize').fetchone()[0]
+        main = conn.execute('SELECT count(*) FROM memories').fetchone()[0]
+        return indexed == main
+    except sqlite3.OperationalError:
+        return False
 
 
 def _migrate_columns(conn: sqlite3.Connection) -> bool:
@@ -272,7 +306,7 @@ def _ensure_fts(conn: sqlite3.Connection, version: int, migrated: bool) -> bool:
     current_triggers = all(
         name in trigger_sql and 'search_text' in trigger_sql[name]
         for name, _ in _FTS_TRIGGER_DDL
-    )
+    ) and 'AFTER UPDATE OF' in trigger_sql.get('memories_au', '')
     if not current_triggers:
         for name, ddl in _FTS_TRIGGER_DDL:
             conn.execute(f'DROP TRIGGER IF EXISTS {name}')
@@ -356,7 +390,9 @@ _FTS_TRIGGER_DDL = (
         END
     """),
     ('memories_au', """
-        CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+        CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE OF
+            goal, approach, outcome, success_key, pitfall, search_text
+        ON memories BEGIN
             INSERT INTO memories_fts(memories_fts, rowid, search_text)
             VALUES ('delete', old.id, old.search_text);
             INSERT INTO memories_fts(rowid, search_text)
@@ -1306,20 +1342,30 @@ def _recall_locked(conn, own_conn, message, limit, reinforce, project_key,
             superseded_by = {row['target_id']: row['source_id']
                              for row in relation_rows}
 
-        def is_expired(row):
-            until = str(row.get('valid_until') or '').strip()
-            if not until:
-                return False
-            try:
-                return datetime.fromisoformat(until.replace('Z', '+00:00')) < datetime.now(
-                    datetime.fromisoformat(until.replace('Z', '+00:00')).tzinfo)
-            except ValueError:
-                return False
+        def validity_state(row):
+            now = datetime.now()
+            for field, label, is_before in (
+                    ('valid_from', 'future', True),
+                    ('valid_until', 'expired', False)):
+                value = str(row.get(field) or '').strip()
+                if not value:
+                    continue
+                try:
+                    boundary = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                    if boundary.tzinfo is not None:
+                        boundary = boundary.replace(tzinfo=None)
+                    if is_before and now < boundary:
+                        return label
+                    if not is_before and now > boundary:
+                        return label
+                except ValueError:
+                    continue
+            return ''
 
         def order(row):
             mid = row['id']
             return (-int(row.get('status') == 'active'),
-                    -int(not is_expired(row)),
+                    -int(not validity_state(row)),
                     -int(mid not in superseded_by),
                     -required_hits[mid], -hits[mid], -matched_chars[mid],
                     text_rank.get(mid, candidate_limit), -int('tag' in sources[mid]),
@@ -1341,13 +1387,16 @@ def _recall_locked(conn, own_conn, message, limit, reinforce, project_key,
                 continue
             if row['id'] in superseded_by and not include_superseded:
                 continue
-            if is_expired(row) and not include_expired:
+            state = validity_state(row)
+            if state and not include_expired:
                 continue
             enriched = dict(row)
             if row['id'] in superseded_by:
                 enriched['_superseded_by'] = superseded_by[row['id']]
-            if is_expired(row):
+            if state == 'expired':
                 enriched['_expired'] = True
+            elif state == 'future':
+                enriched['_not_yet_valid'] = True
             relevant.append(enriched)
         results = sorted(relevant, key=order)[:limit]
         explanation = {
@@ -1864,6 +1913,11 @@ def get_stats(db_conn: Optional[sqlite3.Connection] = None,
                 WHERE status='active' AND valid_until <> ''
                   AND datetime(valid_until) < datetime('now','localtime')
                   {project_sql}""", project_params).fetchone()[0]
+        future = conn.execute(
+            f"""SELECT COUNT(*) FROM memories
+                WHERE status='active' AND valid_from <> ''
+                  AND datetime(valid_from) > datetime('now','localtime')
+                  {project_sql}""", project_params).fetchone()[0]
         superseded = conn.execute(
             f"""SELECT COUNT(DISTINCT r.target_id)
                 FROM memory_relations r
@@ -1876,7 +1930,8 @@ def get_stats(db_conn: Optional[sqlite3.Connection] = None,
                   {project_sql}""", project_params).fetchone()[0]
         oldest = conn.execute(
             f"""SELECT MIN(last_used) FROM memories
-                WHERE status='active' {project_sql}""",
+                WHERE status='active' AND COALESCE(use_count,0)=0
+                  {project_sql}""",
             project_params).fetchone()[0]
         oldest_days = None
         if oldest:
@@ -1895,6 +1950,7 @@ def get_stats(db_conn: Optional[sqlite3.Connection] = None,
             'by_kind': by_kind,
             'by_verification': by_verification,
             'expired_active': expired,
+            'not_yet_valid_active': future,
             'superseded_targets': superseded,
             'unused_active': unused,
             'oldest_active_unused_days': oldest_days,
@@ -1921,6 +1977,8 @@ def format_memory_summary(m: dict, index: int = 0) -> str:
         flags.append(f"superseded-by:#{m['_superseded_by']}")
     if m.get('_expired'):
         flags.append('expired')
+    if m.get('_not_yet_valid'):
+        flags.append('not-yet-valid')
     suffix = f" [{' '.join(flags)}]" if flags else ''
     lines = [f"{index}. #{m['id']} {scope}{_clip_text(m.get('goal'), 120)}{suffix}"]
     if m.get('outcome'):
@@ -1990,6 +2048,8 @@ def format_recall_context(m: dict, index: int = 0) -> str:
         flags.append(f"superseded-by:#{m['_superseded_by']}")
     if m.get('_expired'):
         flags.append('expired')
+    if m.get('_not_yet_valid'):
+        flags.append('future')
     suffix = f" ({', '.join(flags)})" if flags else ''
     lines = [f"{index}. #{m['id']} {scope}{_clip_text(m.get('goal'), 120)}{suffix}"]
     if m.get('outcome'):
