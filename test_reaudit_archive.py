@@ -170,7 +170,8 @@ except sqlite3.OperationalError as e:
 c.close()
 '''
         def trace(sql):
-            if 'SELECT id, weight, use_count, last_used, decay_cursor_at FROM memories' in sql:
+            if ('SELECT id, weight, use_count, last_used, decay_cursor_at' in sql
+                    and 'FROM memories' in sql):
                 child = subprocess.run([sys.executable,'-c',program,str(self.path),str(mid)],
                                        text=True,capture_output=True,timeout=10)
                 if child.returncode:

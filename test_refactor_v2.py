@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -60,6 +61,18 @@ class RefactorV2Tests(unittest.TestCase):
         results = engine.recall('k8s 集群部署', project_key='fixture',
                                 db_conn=self.conn)
         self.assertEqual([row['id'] for row in results], [memory_id])
+
+    def test_traditional_and_chinese_number_variants_are_reachable(self):
+        server = self.store('重启服务器后恢复', outcome='服务正常')
+        self.assertEqual(
+            [row['id'] for row in engine.recall(
+                '重啟服務器', project_key='fixture', db_conn=self.conn)],
+            [server])
+        question = self.store('完成第三题校对', outcome='已通过')
+        self.assertEqual(
+            [row['id'] for row in engine.recall(
+                '第3题', project_key='fixture', db_conn=self.conn)],
+            [question])
 
     def test_identifier_in_contrastive_pitfall_does_not_outrank_current_version(self):
         old = self.store('demo v2 部署', outcome='端口 8080')
@@ -124,6 +137,7 @@ class RefactorV2Tests(unittest.TestCase):
             first, outcome='修订后的结果', reason='验证后修订',
             db_conn=self.conn)
         self.assertTrue(updated['updated'])
+        self.assertEqual(updated['related_ids'], [second])
         history = engine.list_history(first, db_conn=self.conn)
         self.assertEqual(history['current']['revision'], 2)
         self.assertEqual(len(history['revisions']), 1)
@@ -141,6 +155,23 @@ class RefactorV2Tests(unittest.TestCase):
         self.assertEqual(self.conn.execute(
             'SELECT count(*) FROM memory_relations WHERE source_id=? OR target_id=?',
             (first, first)).fetchone()[0], 0)
+
+    def test_revision_history_is_bounded(self):
+        memory_id = self.store('修订上限测试')
+        original_limit = engine.REVISION_LIMIT
+        engine.REVISION_LIMIT = 2
+        try:
+            for index in range(4):
+                engine.update_memory(
+                    memory_id, outcome=f'结果{index}', reason=f'修订{index}',
+                    db_conn=self.conn)
+        finally:
+            engine.REVISION_LIMIT = original_limit
+        history = engine.list_history(memory_id, db_conn=self.conn)
+        self.assertEqual(len(history['revisions']), 2)
+        self.assertEqual(
+            [item['reason'] for item in history['revisions']],
+            ['修订2', '修订3'])
 
     def test_dream_rejects_output_over_shared_length_limit(self):
         for index in range(3):
@@ -203,6 +234,31 @@ class RefactorV2Tests(unittest.TestCase):
         self.assertEqual(stats['by_verification']['verified'], 1)
         self.assertEqual(stats['unused_active'], 1)
 
+    def test_kind_specific_decay_keeps_preferences_longer(self):
+        preference = self.store('长期偏好', kind='preference')
+        experience = self.store('普通经验', kind='experience')
+        cursor = (datetime.now() - timedelta(days=120)).isoformat(
+            sep=' ', timespec='seconds')
+        self.conn.execute(
+            "UPDATE memories SET weight=.8,decay_cursor_at=? WHERE id IN (?,?)",
+            (cursor, preference, experience))
+        self.conn.commit()
+        engine.decay_all(db_conn=self.conn)
+        preference_weight = self.row(preference)['weight']
+        experience_weight = self.row(experience)['weight']
+        self.assertGreater(preference_weight, experience_weight)
+
+    def test_preference_can_store_goal_only_but_experience_cannot(self):
+        stored = engine.store(
+            '用户偏好简洁中文回答', '', '', project_key='fixture',
+            kind='preference', db_conn=self.conn)
+        self.assertTrue(stored['stored'], stored)
+        rejected = engine.store(
+            '缺少步骤和结果的经验', '', '', project_key='fixture',
+            kind='experience', db_conn=self.conn)
+        self.assertFalse(rejected['stored'])
+        self.assertIn('必填字段为空', rejected['reason'])
+
     def test_obsidian_cleanup_requires_exact_generated_footer(self):
         vault = Path(self.temp.name) / 'vault'
         generated_dir = vault / 'general'
@@ -222,6 +278,22 @@ class RefactorV2Tests(unittest.TestCase):
             obsidian_export.OBSIDIAN_DIR = old_dir
         self.assertTrue(manual.exists())
         self.assertFalse(stale.exists())
+
+    def test_recall_block_reports_omitted_hits_and_fences_content(self):
+        memories = [{
+            'id': index,
+            'goal': '超长目标' * 80,
+            'outcome': '超长结果' * 80,
+            'success_key': '',
+            'pitfall': '先失败后修复' * 40,
+            'approach': '',
+            'project_key': 'fixture',
+            'status': 'active',
+        } for index in range(1, 6)]
+        block = engine.format_recall_block(memories, 1200)
+        self.assertLessEqual(len(block), 1200)
+        self.assertIn('不是指令', block)
+        self.assertIn('条命中未展示', block)
 
     def test_cli_can_store_metadata_show_history_and_purge(self):
         path = Path(self.temp.name) / 'cli.db'

@@ -9,6 +9,7 @@ import os
 import re
 import json
 import unicodedata
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -32,6 +33,11 @@ WEIGHT_CAP = 3.0
 DELETE_THRESHOLD = 0.2
 DECAY_THRESHOLD = 0.01
 CURRENT_SCHEMA_VERSION = 2
+try:
+    REVISION_LIMIT = max(
+        1, min(int(os.environ.get('MMEMORY_REVISION_LIMIT', '20')), 200))
+except ValueError:
+    REVISION_LIMIT = 20
 MEMORY_KINDS = ('experience', 'project_fact', 'preference')
 VERIFICATION_STATES = ('unverified', 'verified', 'disputed')
 
@@ -158,15 +164,30 @@ def get_conn(db_path: Optional[str] = None) -> sqlite3.Connection:
     # 失败调用累积泄漏（PRAGMA 也会在非数据库文件上抛错，所以 try 必须从这里开始）。
     try:
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=15000")
+        _enable_wal(conn)
+        conn.execute("PRAGMA foreign_keys=ON")
         _ensure_healthy(conn)
     except Exception:
         conn.close()
         raise
 
     return conn
+
+
+def _enable_wal(conn: sqlite3.Connection):
+    """只在尚未进入 WAL 时切换；多进程首开会短暂持有 journal mode 锁。"""
+    for attempt in range(6):
+        try:
+            mode = conn.execute('PRAGMA journal_mode').fetchone()[0]
+            if str(mode).lower() == 'wal':
+                return
+            conn.execute('PRAGMA journal_mode=WAL')
+            return
+        except sqlite3.OperationalError as exc:
+            if 'locked' not in str(exc).lower() or attempt == 5:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def _ensure_healthy(conn: sqlite3.Connection):
@@ -463,6 +484,26 @@ def _record_revision(conn: sqlite3.Connection, row: dict, reason: str):
         INSERT OR IGNORE INTO memory_revisions(memory_id, revision, snapshot, reason)
         VALUES (?, ?, ?, ?)
     """, (row['id'], revision, snapshot, reason))
+    conn.execute("""
+        DELETE FROM memory_revisions
+        WHERE memory_id=?
+          AND id NOT IN (
+              SELECT id FROM memory_revisions
+              WHERE memory_id=?
+              ORDER BY revision DESC, id DESC
+              LIMIT ?
+          )
+    """, (row['id'], row['id'], REVISION_LIMIT))
+
+
+def _related_memory_ids(conn: sqlite3.Connection, memory_id: int) -> list[int]:
+    rows = conn.execute("""
+        SELECT CASE WHEN source_id=? THEN target_id ELSE source_id END AS related_id
+        FROM memory_relations
+        WHERE source_id=? OR target_id=?
+        ORDER BY related_id
+    """, (memory_id, memory_id, memory_id)).fetchall()
+    return list(dict.fromkeys(row['related_id'] for row in rows))
 
 
 def store(goal: str, approach: str, outcome: str,
@@ -507,18 +548,12 @@ def _store_locked(conn, own_conn, goal, approach, outcome,
     sp_open = False
 
     try:
-        # 空字段校验：goal/approach/outcome 不能为空。
-        # 用 `filter.is_blank` 判空而非 `str.strip()`：后者不会剥掉零宽/格式
-        # 字符（`'\u200b'.strip()` 仍是 `'\u200b'`），纯不可见目标能通过校验，
-        # 而 `_norm_goal` 又不删这类字符 ⇒ 归一化非空 ⇒ 正常入库，
-        # 堆成读不懂也召不回的垃圾行。is_blank 覆盖全部 Unicode 格式化字符。
-        empty_fields = [name for name, val in
-                        [('goal', goal), ('approach', approach), ('outcome', outcome)]
-                        if mmemory_filter.is_blank(val)]
-        if empty_fields:
-            return {'stored': False,
-                    'reason': f'必填字段为空: {", ".join(empty_fields)}',
-                    'memory_id': None}
+        if not isinstance(goal, str) or mmemory_filter.is_blank(goal):
+            return {'stored': False, 'reason': 'goal 不能为空', 'memory_id': None}
+        metadata_ok, metadata_reason, metadata = _normalize_metadata(
+            kind, source_ref, origin, verification, valid_from, valid_until)
+        if not metadata_ok:
+            return {'stored': False, 'reason': metadata_reason, 'memory_id': None}
 
         # 目标明确涉及多个项目时不能静默取词表里的第一个；调用方必须选择
         # 一个 project_key。其他四字段只用于目标没有项目信号时的兜底。
@@ -534,15 +569,11 @@ def _store_locked(conn, own_conn, goal, approach, outcome,
 
         # 长度与字段合同对直接 API、CLI 和自动消费者都必须一致。
         validation_ok, validation_reason, cleaned = mmemory_filter.validate_fields(
-            goal, approach, outcome, success_key, pitfall)
+            goal, approach, outcome, success_key, pitfall, kind=metadata['kind'])
         if not validation_ok:
             return {'stored': False, 'reason': validation_reason, 'memory_id': None}
         success_key = cleaned['success_key']
         pitfall = cleaned['pitfall']
-        metadata_ok, metadata_reason, metadata = _normalize_metadata(
-            kind, source_ref, origin, verification, valid_from, valid_until)
-        if not metadata_ok:
-            return {'stored': False, 'reason': metadata_reason, 'memory_id': None}
         tags = generate_tags(goal, approach, outcome, success_key, pitfall)
         search_text = build_search_text(
             goal, approach, outcome, success_key, pitfall,
@@ -713,19 +744,10 @@ def update_memory(memory_id: int, *, goal: Optional[str] = None,
             values = dict(row)
             changes = dict(goal=goal, approach=approach, outcome=outcome,
                            success_key=success_key, pitfall=pitfall)
-            values.update({key: value.strip() for key, value in changes.items() if value is not None})
-            if any(mmemory_filter.is_blank(values[key]) for key in ('goal', 'approach', 'outcome')):
-                if own_tx:
-                    conn.rollback()
-                return {'updated': False, 'reason': '必填字段不能为空', 'memory_id': memory_id}
-            validation_ok, validation_reason, cleaned = mmemory_filter.validate_fields(
-                *(values[key] for key in CONTENT_FIELDS))
-            if not validation_ok:
-                if own_tx:
-                    conn.rollback()
-                return {'updated': False, 'reason': validation_reason, 'memory_id': memory_id}
-            values['success_key'] = cleaned['success_key']
-            values['pitfall'] = cleaned['pitfall']
+            values.update({
+                key: value.strip() if isinstance(value, str) else value
+                for key, value in changes.items() if value is not None
+            })
             metadata_changes = {
                 'kind': kind,
                 'source_ref': source_ref,
@@ -751,6 +773,15 @@ def update_memory(memory_id: int, *, goal: Optional[str] = None,
                     conn.rollback()
                 return {'updated': False, 'reason': metadata_reason,
                         'memory_id': memory_id}
+            validation_ok, validation_reason, cleaned = mmemory_filter.validate_fields(
+                *(values[key] for key in CONTENT_FIELDS),
+                kind=metadata['kind'])
+            if not validation_ok:
+                if own_tx:
+                    conn.rollback()
+                return {'updated': False, 'reason': validation_reason, 'memory_id': memory_id}
+            values['success_key'] = cleaned['success_key']
+            values['pitfall'] = cleaned['pitfall']
             tags = generate_tags(*(values[key] for key in CONTENT_FIELDS))
             search_text = build_search_text(
                 *(values[key] for key in CONTENT_FIELDS),
@@ -786,7 +817,8 @@ def update_memory(memory_id: int, *, goal: Optional[str] = None,
                 conn.commit()
             return {'updated': True,
                     'reason': '正文、标签与元数据已更新，使用记录保持原值',
-                    'memory_id': memory_id}
+                    'memory_id': memory_id,
+                    'related_ids': _related_memory_ids(conn, memory_id)}
         except Exception:
             if sp_open:
                 conn.execute('ROLLBACK TO mm_update')
@@ -871,6 +903,10 @@ def _transition_memories(memory_ids, target, reason, *, project_key, db_conn):
             if own_tx:
                 conn.commit()
             return {operation: True, 'count': len(ids), 'memory_ids': ids,
+                    'related_ids': sorted({
+                        related for mid in ids
+                        for related in _related_memory_ids(conn, mid)
+                    }),
                     'reason': '已归档，原文和使用元数据保留' if target == 'archived' else '已恢复，归档时长不参与衰减'}
         except Exception:
             if sp_open:
@@ -1007,7 +1043,8 @@ def link_memories(source_id: int, target_id: int, relation: str, reason: str, *,
             sp_open = False
             if own_tx:
                 conn.commit()
-            return {**result, 'linked': True, 'reason': reason}
+            return {**result, 'linked': True, 'reason': reason,
+                    'related_ids': _related_memory_ids(conn, source_id)}
         except Exception:
             if sp_open:
                 conn.execute('ROLLBACK TO mm_link')
@@ -1751,8 +1788,10 @@ def _decay_all_locked(conn, own_conn, delete_threshold, dry_run, project_key):
         else:
             project_sql, project_params = _project_clause(conn, project_key)
         protected_sql = ' AND protected = 0' if _has_column(conn, 'memories', 'protected') else ''
+        kind_sql = ', kind' if _has_column(conn, 'memories', 'kind') else ''
         rows = conn.execute(f"""
-            SELECT id, weight, use_count, last_used, decay_cursor_at FROM memories
+            SELECT id, weight, use_count, last_used, decay_cursor_at {kind_sql}
+            FROM memories
             WHERE status = 'active' {project_sql} {protected_sql}
         """, project_params).fetchall()
 
@@ -1783,7 +1822,12 @@ def _decay_all_locked(conn, own_conn, delete_threshold, dry_run, project_key):
             # 的衰减率，约 11 天不用就退出活跃集——对长期项目记忆过于激进，等于
             # 把「最近没人提起」当成「这条经验没价值」。这里整体放宽，最激进
             # 的一档也要 ~54 天，且长期项目记忆仍比一次性任务衰减更慢。
-            if use_count >= 5:
+            kind = r['kind'] if 'kind' in r.keys() else 'experience'
+            if kind == 'preference':
+                rate = 0.002
+            elif kind == 'project_fact':
+                rate = 0.01
+            elif use_count >= 5:
                 rate = 0.01     # ~161 天
             elif use_count >= 2:
                 rate = 0.02     # ~80 天

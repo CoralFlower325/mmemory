@@ -354,6 +354,29 @@ DEFAULT_TERM_EQUIVALENTS: dict[str, tuple[str, ...]] = {
     'authorization': ('auth', '授权'),
     '认证': ('auth', 'authentication'),
     '授权': ('auth', 'authorization'),
+    '重启': ('重啟', '重新启动', '重新啟動'),
+    '重啟': ('重启', '重新启动', '重新啟動'),
+    '服务器': ('服務器',),
+    '服務器': ('服务器',),
+    '网络': ('網絡',),
+    '網絡': ('网络',),
+    '记忆': ('記憶',),
+    '記憶': ('记忆',),
+    '系统': ('系統',),
+    '系統': ('系统',),
+    '项目': ('項目',),
+    '項目': ('项目',),
+    '测试': ('測試',),
+    '測試': ('测试',),
+    '失败': ('失敗', '报错', '報錯'),
+    '失敗': ('失败', '报错', '報錯'),
+    '修复': ('修復',),
+    '修復': ('修复',),
+    '验证': ('驗證',),
+    '驗證': ('验证',),
+    '数据库': ('數據庫', '資料庫'),
+    '數據庫': ('数据库',),
+    '資料庫': ('数据库',),
 }
 
 
@@ -392,6 +415,63 @@ def _load_term_equivalents() -> dict[str, tuple[str, ...]]:
 TERM_EQUIVALENTS = _load_term_equivalents()
 
 
+_CN_DIGITS = {'零': 0, '〇': 0, '一': 1, '二': 2, '两': 2, '三': 3,
+              '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9}
+
+
+def _parse_small_chinese_number(text: str) -> Optional[int]:
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    if '百' in text:
+        left, _, right = text.partition('百')
+        hundreds = _CN_DIGITS.get(left, 1) if left else 1
+        rest = _parse_small_chinese_number(right) if right else 0
+        return hundreds * 100 + (rest or 0) if rest is not None else None
+    if '十' in text:
+        left, _, right = text.partition('十')
+        tens = _CN_DIGITS.get(left, 1) if left else 1
+        ones = _CN_DIGITS.get(right, 0) if right else 0
+        return tens * 10 + ones
+    if len(text) == 1:
+        return _CN_DIGITS.get(text)
+    return None
+
+
+def _format_small_chinese_number(value: int) -> str:
+    digits = '零一二三四五六七八九'
+    if value < 10:
+        return digits[value]
+    if value < 20:
+        return '十' + (digits[value % 10] if value % 10 else '')
+    if value < 100:
+        return digits[value // 10] + '十' + (
+            digits[value % 10] if value % 10 else '')
+    if value < 1000:
+        rest = value % 100
+        head = digits[value // 100] + '百'
+        if rest == 0:
+            return head
+        if rest < 10:
+            return head + '零' + digits[rest]
+        return head + _format_small_chinese_number(rest)
+    return str(value)
+
+
+def _numeric_equivalents(term: str) -> tuple[str, ...]:
+    match = re.fullmatch(r'第(\d+)([题卷章节])', term)
+    if match:
+        value = int(match.group(1))
+        return (f'第{_format_small_chinese_number(value)}{match.group(2)}',)
+    match = re.fullmatch(r'第([零〇一二两三四五六七八九十百]+)([题卷章节])', term)
+    if match:
+        value = _parse_small_chinese_number(match.group(1))
+        if value is not None:
+            return (f'第{value}{match.group(2)}',)
+    return ()
+
+
 def search_term_equivalents(term: str) -> tuple[str, ...]:
     """返回查询词的可选等价写法；原词由调用方保留。"""
     folded = (term or '').casefold()
@@ -401,6 +481,7 @@ def search_term_equivalents(term: str) -> tuple[str, ...]:
     if canonical:
         values.extend(key for key, value in synonym_map.items()
                       if value == canonical and key != folded)
+    values.extend(_numeric_equivalents(term))
     return tuple(dict.fromkeys(values))
 
 

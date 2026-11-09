@@ -167,7 +167,8 @@ def apply_merge(group: dict, merged_memories: list[dict],
         if any(not isinstance(m.get(k, ''), str) for k in engine.CONTENT_FIELDS):
             return {'merged': False, 'reason': '合并输出的五字段必须是字符串'}
         ok, reason, _ = engine_mmemory_filter.validate_fields(
-            *(m.get(k, '') for k in engine.CONTENT_FIELDS))
+            *(m.get(k, '') for k in engine.CONTENT_FIELDS),
+            kind=m.get('kind', group.get('kind', 'experience')))
         if not ok:
             return {'merged': False, 'reason': f'合并输出校验失败：{reason}'}
         metadata_ok, metadata_reason, _ = engine._normalize_metadata(

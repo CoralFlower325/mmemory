@@ -108,7 +108,8 @@ MAX_MEMORY_CHARS = 1000
 
 
 def validate_fields(goal: str, approach: str, outcome: str,
-                    success_key: str = '', pitfall: str = '') -> tuple[bool, str, dict]:
+                    success_key: str = '', pitfall: str = '',
+                    kind: str = 'experience') -> tuple[bool, str, dict]:
     """
     校验必填字段，相似度仅提示；不删除可选字段中的独立信息。
     返回 (passed, reason, cleaned_fields)。字段是否有意义由作者判断。
@@ -116,6 +117,10 @@ def validate_fields(goal: str, approach: str, outcome: str,
     记忆只保留恢复入口。完整实施细节应放在项目文档中；超长自动记录会在每次
     召回时整段注入，既难以阅读，也会挤占当前任务上下文。
     """
+    if any(not isinstance(value, str) for value in
+           (goal, approach, outcome, success_key, pitfall)):
+        return False, '五字段必须是字符串', {}
+
     cleaned = {
         'success_key': success_key.strip(),
         'pitfall': pitfall.strip(),
@@ -123,10 +128,14 @@ def validate_fields(goal: str, approach: str, outcome: str,
 
     fields_to_check = [goal, approach, outcome]
 
-    # 空字段校验：goal/approach/outcome 不能为空
+    required = {'goal'}
+    if kind == 'project_fact':
+        required.add('outcome')
+    elif kind == 'experience':
+        required.update({'approach', 'outcome'})
     empty_fields = [name for name, val in
                     [('goal', goal), ('approach', approach), ('outcome', outcome)]
-                    if not isinstance(val, str) or is_blank(val)]
+                    if name in required and (not isinstance(val, str) or is_blank(val))]
     if empty_fields:
         return False, f'必填字段为空: {", ".join(empty_fields)}', cleaned
 
@@ -449,6 +458,7 @@ def should_store(conversation: dict) -> tuple[bool, str, dict]:
         outcome=conversation.get('outcome', ''),
         success_key=conversation.get('success_key', ''),
         pitfall=conversation.get('pitfall', ''),
+        kind=kind,
     )
     # CLI filter 不提供必填正文时，只判断任务是否值得保留；store 负责拒绝空正文。
     if not fields_ok and '必填字段为空' not in fields_reason:
@@ -483,7 +493,8 @@ def assess_messages(messages: list[dict], fields: dict, *,
     names = ('goal', 'approach', 'outcome', 'success_key', 'pitfall')
     if any(not isinstance(fields.get(name, ''), str) for name in names):
         return False, '五字段必须是字符串', {}
-    ok, reason, cleaned = validate_fields(*(fields.get(name, '') for name in names))
+    ok, reason, cleaned = validate_fields(
+        *(fields.get(name, '') for name in names), kind=memory_kind)
     if not ok:
         return False, reason, cleaned
 

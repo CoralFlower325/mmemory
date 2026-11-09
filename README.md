@@ -79,9 +79,9 @@ MMEMORY_DB=/absolute/path/to/private-memory.db .venv/bin/python cli.py stats
 .venv/bin/python cli.py list --project-key mmemory
 ```
 
-`goal`, `approach`, and `outcome` are required. All five fields together are
-limited to 1000 characters, so keep operational detail in project docs and
-store only the current fact, lesson, and document entry point.
+`goal` is always required. Experiences also require `approach` and `outcome`;
+project facts require `outcome`; preferences may use `goal` alone. All five fields
+together are limited to 1000 characters.
 
 ## Project Namespaces
 
@@ -159,7 +159,9 @@ Memory type, provenance, verification, and validity are persisted:
 
 `kind` is `experience`, `project_fact`, or `preference`. Verification is
 `unverified`, `verified`, or `disputed`. Updates and lifecycle changes retain
-snapshots in `memory_revisions`.
+snapshots in `memory_revisions`; the default limit is 20 retained revisions per
+memory and can be changed with `MMEMORY_REVISION_LIMIT`. Preferences decay more
+slowly than experiences and project facts.
 
 ## CLI
 

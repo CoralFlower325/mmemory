@@ -274,8 +274,8 @@ def main():
     # store
     p = sub.add_parser('store', help='存储记忆')
     p.add_argument('--goal', required=True)
-    p.add_argument('--approach', required=True)
-    p.add_argument('--outcome', required=True)
+    p.add_argument('--approach', default='')
+    p.add_argument('--outcome', default='')
     p.add_argument('--success-key', default='')
     p.add_argument('--pitfall', default='')
     p.add_argument('--project-key', default=None,

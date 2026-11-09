@@ -78,8 +78,8 @@ MMEMORY_DB=/absolute/path/to/private-memory.db .venv/bin/python cli.py stats
 .venv/bin/python cli.py list --project-key mmemory
 ```
 
-`goal`、`approach`、`outcome` 必填。五字段合计上限为 1000 字符，因此完整
-操作细节应放在项目文档中，记忆只保留当前事实、关键教训和文档入口。
+`goal` 始终必填；experience 还要求 `approach` 和 `outcome`，project_fact
+要求 `outcome`，preference 可以只写 `goal`。五字段合计上限为 1000 字符。
 
 ## 项目命名空间
 
@@ -154,7 +154,9 @@ mmemory 内置少量中性示例。复制 [`projects.example.json`](projects.exa
 
 `kind` 支持 `experience`、`project_fact` 和 `preference`；验证状态支持
 `unverified`、`verified` 和 `disputed`。update、归档、恢复、保护和合并会在
-`memory_revisions` 中保留快照。
+`memory_revisions` 中保留快照；每条记忆默认保留最近 20 个修订，可用
+`MMEMORY_REVISION_LIMIT` 调整。preference 的衰减速度慢于 experience 和
+project_fact。
 
 ## 命令行
 
