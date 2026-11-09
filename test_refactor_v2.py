@@ -617,6 +617,13 @@ class RefactorV2Tests(unittest.TestCase):
         self.assertNotIn('\x1b', context)
         self.assertNotIn('\u2028', context)
         self.assertNotIn('private/source.md', context)
+        experience = engine.format_recall_context({
+            'id': 10, 'goal': '普通经验', 'outcome': '结果',
+            'pitfall': '处理方式', 'success_key': '', 'approach': '',
+            'project_key': 'fixture', 'status': 'active',
+            'kind': 'experience', 'verification': 'unverified',
+        })
+        self.assertIn('unverified', experience)
 
     def test_cli_can_store_metadata_show_history_and_purge(self):
         path = Path(self.temp.name) / 'cli.db'
