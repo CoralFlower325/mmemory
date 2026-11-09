@@ -22,10 +22,16 @@ OBSIDIAN_DIR = Path(os.environ.get(
 
 
 def _is_mmemory_file(filepath: Path) -> bool:
-    """检查文件是否由 mmemory 生成（含 mmemory ID 标记）"""
+    """只把包含完整生成页脚的 Markdown 视为 mmemory 生成物。"""
     try:
         content = filepath.read_text(encoding='utf-8')
-        return '*mmemory ID:' in content
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        if not lines:
+            return False
+        matches = [re.fullmatch(
+            r'\*mmemory ID: \d+ \| Status: (?:active|archived)\*',
+            line) for line in lines[-3:]]
+        return any(matches)
     except Exception:
         return False
 

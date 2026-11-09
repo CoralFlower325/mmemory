@@ -8,6 +8,7 @@ Tag 生成系统：三层
 import json
 import os
 import re
+import unicodedata
 from pathlib import Path
 from typing import Optional
 
@@ -100,7 +101,7 @@ def _alias_tuple(value, label: str) -> tuple[str, ...]:
     for alias in value:
         if not isinstance(alias, str) or not alias.strip():
             raise ValueError(f'{label} 必须是非空字符串数组')
-        aliases.append(alias.strip())
+        aliases.append(unicodedata.normalize('NFC', alias).strip())
     return tuple(aliases)
 
 
@@ -166,7 +167,7 @@ def _reject_duplicate_aliases(project_map: dict[str, tuple[str, ...]],
     seen = {}
     for project, aliases in project_map.items():
         for alias in aliases:
-            folded = alias.casefold()
+            folded = unicodedata.normalize('NFC', alias).casefold()
             owner = seen.get(folded)
             if owner is not None and owner != project:
                 raise ValueError(
@@ -178,17 +179,44 @@ PROJECT_KEYWORDS, QUERY_PROJECT_KEYWORDS = load_project_config()
 
 
 def _alias_in_text(alias: str, text: str) -> bool:
-    lowered = (text or '').lower()
-    alias = alias.lower()
+    lowered = unicodedata.normalize('NFC', text or '').casefold()
+    alias = unicodedata.normalize('NFC', alias).casefold()
     if alias.isascii() and alias.isalnum():
         return re.search(rf'(?<![a-z0-9_]){re.escape(alias)}(?![a-z0-9_])', lowered) is not None
     return alias in lowered
 
 
+def _keyword_matches(text: str, keywords) -> list[tuple[int, int, str]]:
+    normalized = unicodedata.normalize('NFC', text or '').casefold()
+    matches = []
+    for project, aliases in keywords:
+        for alias in aliases:
+            needle = unicodedata.normalize('NFC', alias).casefold()
+            if needle.isascii() and needle.isalnum():
+                pattern = rf'(?<![a-z0-9_]){re.escape(needle)}(?![a-z0-9_])'
+                spans = (m.span() for m in re.finditer(pattern, normalized))
+            else:
+                spans = (m.span() for m in re.finditer(re.escape(needle), normalized))
+            for start, end in spans:
+                matches.append((start, end, project))
+    # 同一段文本同时命中“实验”和“实验三”时，只保留更具体的别名。
+    filtered = []
+    for start, end, project in matches:
+        length = end - start
+        contained = any(
+            other_start <= start and end <= other_end and other_end - other_start > length
+            for other_start, other_end, _ in matches
+        )
+        if not contained:
+            filtered.append((start, end, project))
+    order = {project: index for index, (project, _) in enumerate(keywords)}
+    return sorted(filtered, key=lambda item: (order.get(item[2], 10**9), item[0], item[1]))
+
+
 def project_keys_in_text(text: str) -> list[str]:
     """返回文本中所有明确的现有项目键，保持词表顺序并去重。"""
-    return [project for project, keywords in PROJECT_KEYWORDS
-            if any(_alias_in_text(keyword, text) for keyword in keywords)]
+    return list(dict.fromkeys(project for _, _, project
+                              in _keyword_matches(text, PROJECT_KEYWORDS)))
 
 
 def infer_query_project_keys(text: str) -> list[str]:
@@ -200,8 +228,8 @@ def infer_query_project_keys(text: str) -> list[str]:
     exact = project_keys_in_text(text)
     if exact:
         return exact
-    matched = {project for project, keywords in QUERY_PROJECT_KEYWORDS
-               if any(_alias_in_text(keyword, text) for keyword in keywords)}
+    matched = {project for _, _, project
+               in _keyword_matches(text, QUERY_PROJECT_KEYWORDS)}
     order = [project for project, _ in PROJECT_KEYWORDS]
     return [project for project in order if project in matched]
 
@@ -211,10 +239,8 @@ def infer_project_key(text: str) -> str:
 
     多个项目词同时出现时保持配置顺序，由调用方在写入前检查歧义。
     """
-    for project, keywords in PROJECT_KEYWORDS:
-        if any(_alias_in_text(keyword, text) for keyword in keywords):
-            return project
-    return ''
+    matches = project_keys_in_text(text)
+    return matches[0] if matches else ''
 
 ACTION_KEYWORDS: dict[str, list[str]] = {
     'debug':     ['bug','报错','error','失败','异常','排查','调试','出错','崩溃','traceback','修复'],
@@ -288,6 +314,206 @@ def extract_keywords(text: str, topk: int = 5) -> list[str]:
 def fallback_tokenize(text: str) -> list[str]:
     """jieba 不可用时的回退分词：按 Unicode 范围切分中文/英文词"""
     return re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z][a-zA-Z0-9_]+', text)
+
+
+DEFAULT_TERM_EQUIVALENTS: dict[str, tuple[str, ...]] = {
+    'k8s': ('kubernetes', 'kube'),
+    'kubernetes': ('k8s', 'kube'),
+    'db': ('database', '数据库'),
+    'database': ('db', '数据库'),
+    '数据库': ('db', 'database'),
+    'config': ('configuration', '配置'),
+    'configuration': ('config', '配置'),
+    '配置': ('config', 'configuration'),
+    'repo': ('repository', '代码库'),
+    'repository': ('repo', '代码库'),
+    '代码库': ('repo', 'repository'),
+    'vm': ('virtual machine', '虚拟机'),
+    'virtual machine': ('vm', '虚拟机'),
+    '虚拟机': ('vm', 'virtual machine'),
+    'llm': ('large language model', '大语言模型'),
+    'large language model': ('llm', '大语言模型'),
+    '大语言模型': ('llm', 'large language model'),
+    'ai': ('artificial intelligence', '人工智能'),
+    'artificial intelligence': ('ai', '人工智能'),
+    '人工智能': ('ai', 'artificial intelligence'),
+    'gpu': ('graphics processing unit', '显卡'),
+    'graphics processing unit': ('gpu', '显卡'),
+    'cpu': ('central processing unit', '处理器'),
+    'central processing unit': ('cpu', '处理器'),
+    'api': ('application programming interface', '接口'),
+    'application programming interface': ('api', '接口'),
+    'cli': ('command line interface', '命令行'),
+    'command line interface': ('cli', '命令行'),
+    '命令行': ('cli', 'command line interface'),
+    'ci': ('continuous integration', '持续集成'),
+    'continuous integration': ('ci', '持续集成'),
+    '持续集成': ('ci', 'continuous integration'),
+    'auth': ('authentication', 'authorization', '认证', '授权'),
+    'authentication': ('auth', '认证'),
+    'authorization': ('auth', '授权'),
+    '认证': ('auth', 'authentication'),
+    '授权': ('auth', 'authorization'),
+    '重启': ('重啟', '重新启动', '重新啟動'),
+    '重啟': ('重启', '重新启动', '重新啟動'),
+    '服务器': ('服務器',),
+    '服務器': ('服务器',),
+    '网络': ('網絡',),
+    '網絡': ('网络',),
+    '记忆': ('記憶',),
+    '記憶': ('记忆',),
+    '系统': ('系統',),
+    '系統': ('系统',),
+    '项目': ('項目',),
+    '項目': ('项目',),
+    '测试': ('測試',),
+    '測試': ('测试',),
+    '失败': ('失敗', '报错', '報錯'),
+    '失敗': ('失败', '报错', '報錯'),
+    '修复': ('修復',),
+    '修復': ('修复',),
+    '验证': ('驗證',),
+    '驗證': ('验证',),
+    '数据库': ('數據庫', '資料庫'),
+    '數據庫': ('数据库',),
+    '資料庫': ('数据库',),
+}
+
+
+def _load_term_equivalents() -> dict[str, tuple[str, ...]]:
+    table = {
+        term.casefold(): list(values)
+        for term, values in DEFAULT_TERM_EQUIVALENTS.items()
+    }
+    configured = os.environ.get('MMEMORY_SYNONYMS_FILE')
+    path = (Path(configured).expanduser() if configured
+            else Path(__file__).with_name('synonyms.json'))
+    if configured and not path.exists():
+        raise FileNotFoundError(f'同义词配置不存在：{path}')
+    if not path.exists():
+        return {term: tuple(dict.fromkeys(values))
+                for term, values in table.items()}
+    data = json.loads(path.read_text(encoding='utf-8'))
+    groups = data.get('equivalents') if isinstance(data, dict) else data
+    if not isinstance(groups, list):
+        raise ValueError('同义词配置必须是数组或包含 equivalents 数组的对象')
+    for group in groups:
+        if not isinstance(group, list) or len(group) < 2 or any(
+                not isinstance(term, str) or not term.strip() for term in group):
+            raise ValueError('每个同义词组至少包含两个非空字符串')
+        normalized = [unicodedata.normalize('NFC', term).strip() for term in group]
+        for term in normalized:
+            key = term.casefold()
+            table.setdefault(key, [])
+            table[key].extend(other for other in normalized if other != term)
+    return {
+        term: tuple(dict.fromkeys(values))
+        for term, values in table.items()
+    }
+
+
+TERM_EQUIVALENTS = _load_term_equivalents()
+
+
+_CN_DIGITS = {'零': 0, '〇': 0, '一': 1, '二': 2, '两': 2, '三': 3,
+              '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9}
+
+
+def _parse_small_chinese_number(text: str) -> Optional[int]:
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    if '百' in text:
+        left, _, right = text.partition('百')
+        hundreds = _CN_DIGITS.get(left, 1) if left else 1
+        rest = _parse_small_chinese_number(right) if right else 0
+        return hundreds * 100 + (rest or 0) if rest is not None else None
+    if '十' in text:
+        left, _, right = text.partition('十')
+        tens = _CN_DIGITS.get(left, 1) if left else 1
+        ones = _CN_DIGITS.get(right, 0) if right else 0
+        return tens * 10 + ones
+    if len(text) == 1:
+        return _CN_DIGITS.get(text)
+    return None
+
+
+def _format_small_chinese_number(value: int) -> str:
+    digits = '零一二三四五六七八九'
+    if value < 10:
+        return digits[value]
+    if value < 20:
+        return '十' + (digits[value % 10] if value % 10 else '')
+    if value < 100:
+        return digits[value // 10] + '十' + (
+            digits[value % 10] if value % 10 else '')
+    if value < 1000:
+        rest = value % 100
+        head = digits[value // 100] + '百'
+        if rest == 0:
+            return head
+        if rest < 10:
+            return head + '零' + digits[rest]
+        return head + _format_small_chinese_number(rest)
+    return str(value)
+
+
+def _numeric_equivalents(term: str) -> tuple[str, ...]:
+    match = re.fullmatch(r'第(\d+)([题卷章节])', term)
+    if match:
+        value = int(match.group(1))
+        return (f'第{_format_small_chinese_number(value)}{match.group(2)}',)
+    match = re.fullmatch(r'第([零〇一二两三四五六七八九十百]+)([题卷章节])', term)
+    if match:
+        value = _parse_small_chinese_number(match.group(1))
+        if value is not None:
+            return (f'第{value}{match.group(2)}',)
+    return ()
+
+
+def search_term_equivalents(term: str) -> tuple[str, ...]:
+    """返回查询词的可选等价写法；原词由调用方保留。"""
+    folded = (term or '').casefold()
+    values = list(TERM_EQUIVALENTS.get(folded, ()))
+    synonym_map = load_synonym_map()
+    canonical = synonym_map.get(folded)
+    if canonical:
+        values.extend(key for key, value in synonym_map.items()
+                      if value == canonical and key != folded)
+    values.extend(_numeric_equivalents(term))
+    return tuple(dict.fromkeys(values))
+
+
+def build_search_text(*parts: str) -> str:
+    """把五字段和标签转换成 FTS5 可直接索引的分词文本。
+
+    默认 unicode61 不会切分连续中文；这里先用 jieba 切词并用空格连接。
+    只保留去重后的稳定 token，避免正文与搜索索引双份无序膨胀。
+    """
+    text = unicodedata.normalize('NFC', ' '.join(str(part or '') for part in parts))
+    if not text.strip():
+        return ''
+    try:
+        import jieba
+        tokens = []
+        for chunk in re.findall(r'[\u4e00-\u9fff]+|[^\s\u4e00-\u9fff]+', text):
+            if re.search(r'[\u4e00-\u9fff]', chunk):
+                tokens.extend(jieba.cut_for_search(chunk))
+            else:
+                tokens.extend(re.findall(r'[a-zA-Z0-9_+#.-]+', chunk))
+    except ImportError:
+        tokens = fallback_tokenize(text)
+    cleaned = []
+    seen = set()
+    for token in tokens:
+        token = (token or '').strip().casefold()
+        if not token or token in seen:
+            continue
+        if re.fullmatch(r'[a-z0-9_+#.-]+', token) or len(token) > 1:
+            seen.add(token)
+            cleaned.append(token)
+    return ' '.join(cleaned)
 
 
 # ── 第三层：同义词归一化 ─────────────────────────────────────────

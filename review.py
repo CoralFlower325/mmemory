@@ -27,6 +27,12 @@ _STATE_RE = re.compile(
     r'可用|可以使用|支持|已启用|已开启|有效)')
 _NEGATIVE_STATES = {'不可用', '不能使用', '无法使用', '不支持', '未启用',
                     '已关闭', '已失效', '失效', '无效'}
+_NUMERIC_FACT_RE = re.compile(
+    r'(?P<entity>端口|价格|额度|配额|容量|超时|线程数|进程数|数量|大小|限制|余额)'
+    r'\s*(?:为|是|设为|改为|=|:|：)?\s*'
+    r'(?P<value>\d+(?:\.\d+)?)\s*'
+    r'(?P<unit>ms|毫秒|秒|分钟|GB|MB|KB|%|元|个)?',
+    re.IGNORECASE)
 
 
 def _matches(text, keyword):
@@ -58,10 +64,14 @@ def _claims(memory, fields):
     claims = []
     for field in fields:
         text = str(memory.get(field) or '')
-        for pattern, kind in ((_VERSION_RE, 'version'), (_STATE_RE, 'state')):
+        for pattern, kind in ((_VERSION_RE, 'version'), (_STATE_RE, 'state'),
+                              (_NUMERIC_FACT_RE, 'numeric')):
             for match in pattern.finditer(text):
                 entity = match.group('entity').casefold()
                 value = match.group('value')
+                unit = match.groupdict().get('unit')
+                if unit:
+                    value += str(unit).casefold()
                 claims.append({
                     'memory_id': memory['id'], 'field': field, 'entity':
                     _ENTITY_ALIASES.get(entity, entity), 'claim_type': kind,
@@ -77,7 +87,8 @@ def _contrasts(left, right):
     for a, b in ((a, b) for a in left for b in right):
         if a['entity'] != b['entity'] or a['claim_type'] != b['claim_type']:
             continue
-        differs = (a['value'] != b['value']) if a['claim_type'] == 'version' else (
+        differs = (a['value'] != b['value']) if a['claim_type'] in (
+            'version', 'numeric') else (
             a['polarity'] != b['polarity'])
         if differs:
             clue = {'type': 'explicit_' + a['claim_type'] + '_difference',
@@ -198,6 +209,11 @@ def review_candidates(*, project_key=None, status='active', limit=50,
             for left, right in combinations(memories, 2):
                 if (left.get('project_key') or '') != (right.get('project_key') or ''):
                     continue
+                contrasts = _contrasts(
+                    _claims(left, engine.CONTENT_FIELDS),
+                    _claims(right, engine.CONTENT_FIELDS))
+                if contrasts:
+                    add('potential_conflict', [left, right], contrasts)
                 exact = memory_filter._norm_goal(left['goal']) == memory_filter._norm_goal(right['goal'])
                 same_terms = len(terms[left['id']]) >= 2 and terms[left['id']] == terms[right['id']]
                 if not exact and not same_terms:
@@ -212,9 +228,6 @@ def review_candidates(*, project_key=None, status='active', limit=50,
                         'different_fields': [field for field in engine.CONTENT_FIELDS if
                                              left.get(field) != right.get(field)],
                         'note': '文字接近不证明同一事实；数字顺序一致仍不能替代人工判断'}])
-                contrasts = _contrasts(_claims(left, ('outcome',)), _claims(right, ('outcome',)))
-                if contrasts:
-                    add('potential_conflict', [left, right], contrasts)
             return {'read_only': True, 'scope': {'project_key': project, 'status': status},
                     'scanned_count': len(memories), 'candidate_count': len(candidates),
                     'truncated': len(candidates) > limit, 'candidates': candidates[:limit],

@@ -54,7 +54,7 @@ class DreamReaudit(unittest.TestCase):
         self.assertEqual([row['id'] for row in archived], self.ids)
         for old, current in zip(before, archived):
             for field in old:
-                if field not in ('status', 'archived_at', 'archive_reason'):
+                if field not in ('status', 'archived_at', 'archive_reason', 'revision'):
                     self.assertEqual(old[field], current[field], field)
             self.assertTrue(current['archived_at'])
             self.assertIn('Dream', current['archive_reason'])

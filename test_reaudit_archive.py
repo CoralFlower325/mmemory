@@ -45,13 +45,15 @@ class ArchiveReaudit(unittest.TestCase):
             self.assertEqual(current['archive_reason'], '明确过时')
             self.assertTrue(current['archived_at'])
             for key in before[mid]:
-                if key not in ('status', 'archive_reason', 'archived_at'):
+                if key not in ('status', 'archive_reason', 'archived_at', 'revision'):
                     self.assertEqual(current[key], before[mid][key], key)
         self.assertEqual(engine.recall('合成经验', db_conn=self.conn, project_key='fixture'), [])
         self.assertEqual(engine.list_all(db_conn=self.conn, project_key='fixture'), [])
         self.assertEqual(len(engine.list_all(status='all', db_conn=self.conn)), 3)
         self.assertEqual(dream.find_merge_groups(self.conn, project_key='fixture'), [])
-        self.assertEqual(engine.get_stats(self.conn), {'active':0,'archived':3,'total':3,'projects':1})
+        stats = engine.get_stats(self.conn)
+        self.assertEqual({key: stats[key] for key in ('active', 'archived', 'total', 'projects')},
+                         {'active':0,'archived':3,'total':3,'projects':1})
         self.assertFalse(engine.update_memory(mids[0], outcome='覆盖历史', db_conn=self.conn)['updated'])
 
     def test_restore_keeps_original_id_and_excludes_archived_time_from_decay(self):
@@ -63,7 +65,7 @@ class ArchiveReaudit(unittest.TestCase):
         self.assertTrue(engine.restore_memories([mid], db_conn=self.conn)['restored'])
         restored = self.row(mid)
         for field in original:
-            if field not in ('decay_cursor_at', 'archived_at', 'archive_reason'):
+            if field not in ('decay_cursor_at', 'archived_at', 'archive_reason', 'revision'):
                 self.assertEqual(original[field], restored[field], field)
         self.assertNotEqual(restored['decay_cursor_at'], '2025-01-01')
         self.assertEqual(engine.decay_all(db_conn=self.conn), {'decayed':0,'archived':0})
@@ -147,8 +149,10 @@ class ArchiveReaudit(unittest.TestCase):
         self.conn.execute('DROP TRIGGER reject_decay')
         self.assertEqual(engine.decay_all(db_conn=self.conn), {'decayed':0,'archived':1})
         for field in before:
-            if field not in ('status','archived_at','archive_reason'):
+            if field not in ('status','archived_at','archive_reason','weight',
+                             'decay_cursor_at','revision'):
                 self.assertEqual(before[field], self.row(mid)[field], field)
+        self.assertLess(self.row(mid)['weight'], before['weight'])
 
     def test_decay_lock_covers_read_before_cross_process_reinforcement(self):
         mid = self.store()
@@ -166,7 +170,8 @@ except sqlite3.OperationalError as e:
 c.close()
 '''
         def trace(sql):
-            if 'SELECT id, weight, use_count, last_used, decay_cursor_at FROM memories' in sql:
+            if ('SELECT id, weight, use_count, last_used, decay_cursor_at' in sql
+                    and 'FROM memories' in sql):
                 child = subprocess.run([sys.executable,'-c',program,str(self.path),str(mid)],
                                        text=True,capture_output=True,timeout=10)
                 if child.returncode:

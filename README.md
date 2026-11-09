@@ -4,7 +4,7 @@
 
 **A local, five-field memory layer for AI-assisted work.**
 
-Store durable lessons in SQLite, find them with FTS5, and keep every project isolated.
+Store durable lessons in SQLite, find them with CJK-aware FTS5, and keep every project isolated.
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
@@ -34,7 +34,7 @@ namespace.
 
 | Keep | Find | Maintain |
 | --- | --- | --- |
-| Five-field records with automatic tags | Project-scoped FTS5, tag, and literal-text recall | Revision, protection, decay, archive, and merge workflows |
+| Five-field records with type, source, verification, and validity metadata | Project-scoped CJK-aware FTS5, aliases, tags, and literal-text recall | Revision, protection, decay, archive, deep recall, hard purge, and merge workflows |
 | Exact de-duplication and milestone updates | Recall explanations and bounded context blocks | Read-only review clues and SQLite-consistent backups |
 | Markdown export for Obsidian | Optional reinforcement only after real use | Synthetic temporary databases for every test |
 
@@ -70,15 +70,18 @@ MMEMORY_DB=/absolute/path/to/private-memory.db .venv/bin/python cli.py stats
   --outcome "Generic action words no longer pull unrelated memories" \
   --success-key "Require a real content match" \
   --pitfall "Tag-only candidates appeared when the query was checked by rank alone; filter candidates by content first" \
+  --kind experience \
+  --verification verified \
+  --source-ref docs/recall-notes.md \
   --project-key mmemory
 
 .venv/bin/python cli.py recall "mmemory recall regression" --explain
 .venv/bin/python cli.py list --project-key mmemory
 ```
 
-`goal`, `approach`, and `outcome` are required. All five fields together are
-limited to 1000 characters, so keep operational detail in project docs and
-store only the current fact, lesson, and document entry point.
+`goal` is always required. Experiences also require `approach` and `outcome`;
+project facts require `outcome`; preferences may use `goal` alone. All five fields
+together are limited to 1000 characters.
 
 ## Project Namespaces
 
@@ -103,16 +106,20 @@ by copying [`projects.example.json`](projects.example.json) to `projects.json`:
 `projects.json` is ignored by Git. Point `MMEMORY_PROJECTS_FILE` at another
 private file when you keep configuration outside the repository.
 
+For domain aliases, copy [`synonyms.example.json`](synonyms.example.json) to
+`synonyms.json` or set `MMEMORY_SYNONYMS_FILE`. Each array is bidirectional.
+
 If a project has no reliable alias, use the same explicit `--project-key` for
 writes and recall. Use `--project-key ""` to select the shared bucket.
 
 ## How Recall Works
 
-Recall combines three sources inside the resolved project:
+Recall combines four layers inside the resolved project:
 
-1. FTS5 and literal matches across the five fields.
-2. Keyword tags generated from the stored text.
-3. Query terms with ASCII word boundaries and identifier-aware splitting.
+1. A jieba-pretokenized `search_text` column backed by FTS5.
+2. Literal matches across the five fields.
+3. Keyword tags generated from the stored text.
+4. Query aliases, ASCII word boundaries, and identifier-aware splitting.
 
 Tags and broad action words such as "fix", "configure", or "status" can affect
 ordering but cannot pull a candidate into the result by themselves. A candidate
@@ -122,17 +129,48 @@ Use `--explain` to inspect the resolved project, required terms, source of each
 hit, and ordering reason. The default injected summary contains the goal,
 outcome, and one lesson, with wrapper text included in a 1200-character budget.
 
+Relations affect recall: a target of a `supersedes` relation is hidden by
+default. `--include-superseded` restores it with a label. `--deep` considers
+archived records after current hits, and `--include-expired` shows records outside
+their validity window. Memory text is presented as data, not as instructions.
+
 Ordinary recall does not change use counts or weights. Add `--reinforce` only
 after the memory was actually used. If a new result changes a known fact, use
 `update ID` rather than storing another phrasing of the same fact.
+
+## Metadata And History
+
+Memory type, provenance, verification, and validity are persisted:
+
+```bash
+.venv/bin/python cli.py store \
+  --goal "Production API listens on port 9090" \
+  --approach "Checked the deployed configuration" \
+  --outcome "Port changed from 8080 to 9090" \
+  --kind project_fact \
+  --verification verified \
+  --source-ref deploy/config.yaml \
+  --valid-from "2026-11-01" \
+  --project-key api-service
+
+.venv/bin/python cli.py update 42 --outcome "Port is 9090" --reason "Deployment verified"
+.venv/bin/python cli.py history 42
+```
+
+`kind` is `experience`, `project_fact`, or `preference`. Verification is
+`unverified`, `verified`, or `disputed`. Updates and lifecycle changes retain
+snapshots in `memory_revisions`; the default limit is 20 retained revisions per
+memory and can be changed with `MMEMORY_REVISION_LIMIT`. Preferences decay more
+slowly than experiences and project facts.
 
 ## CLI
 
 | Command | What it does |
 | --- | --- |
 | `store` | Add a five-field memory or validate an imported conversation |
-| `recall` | Search one project and optionally explain or reinforce hits |
+| `recall` | Search one project; supports `--explain`, `--deep`, validity, supersession, and explicit reinforcement |
 | `update ID` | Revise text while preserving project and usage metadata |
+| `history ID` | Inspect the current row and prior snapshots |
 | `list` | Inspect active, archived, or all memories |
 | `protect` / `unprotect` | Exempt or resume decay by explicit ID and reason |
 | `archive` / `restore` | Transition memory status without changing its ID |
@@ -140,8 +178,10 @@ after the memory was actually used. If a new result changes a known fact, use
 | `link` / `relations` | Record and inspect `supersedes` or `derived_from` evidence |
 | `decay` | Preview or apply elapsed-time decay and threshold archival |
 | `dream` | Produce manual merge candidates; never edits automatically |
+| `reindex` | Rebuild jieba tokens and the FTS5 index |
+| `purge` | Irreversibly delete a record, its relations, and revision snapshots |
 | `backup` | Create a consistent SQLite snapshot without overwriting |
-| `stats` | Count active, archived, and total records |
+| `stats` | Show counts, kinds, verification states, expiry, unused records, and supersession health |
 
 Run any command with `--help` for its exact arguments.
 
@@ -157,9 +197,14 @@ Repeated dry runs do not charge the same elapsed period twice. Protected records
 skip decay. Archiving and restoration keep the original ID; archived time is not
 charged retroactively after restore.
 
+Existing schema v1 databases are upgraded in a write-locked transaction on first
+open. The migration preserves IDs, adds v2 metadata and revisions, and rebuilds
+the derived search index. Use `reindex` after external SQL edits.
+
 `review` is evidence, not a semantic judge. `dream` is a manual dry run. Merge
 application is atomic, rejects groups containing protected sources, and records
-derived-from relations instead of silently deleting history.
+derived-from relations instead of silently deleting history. `purge` is the
+separate irreversible path for sensitive content.
 
 Before maintaining a real database, create a consistent snapshot:
 
@@ -211,13 +256,13 @@ Repository map:
 | Path | Responsibility |
 | --- | --- |
 | `engine.py` | Database, storage, recall, lifecycle, and backup |
-| `tagger.py` | Fixed tags, keywords, and project alias configuration |
+| `tagger.py` | Fixed tags, search tokens, aliases, and configurable equivalent terms |
 | `filter.py` | Validation, quality checks, and milestone replacement |
 | `dream.py` | Manual merge candidates and atomic application |
 | `review.py` | Read-only review clues |
 | `obsidian_export.py` | Deterministic Markdown export |
 | `cli.py` | Command-line surface |
-| `schema.sql` | SQLite tables, FTS5 index, and triggers |
+| `schema.sql` | Schema v2 tables, revision history, FTS5 index, and triggers |
 
 Contributions should keep the public test suite synthetic, focused, and
 reproducible. Read [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md)

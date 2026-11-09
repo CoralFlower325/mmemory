@@ -16,6 +16,11 @@ python3 -m venv .venv
 Tests must use synthetic temporary databases. Do not copy, inspect, or commit a
 real memory database. The test runner sets `MMEMORY_DB` for each subprocess.
 
+Schema changes must preserve old IDs and append columns in migration order.
+Search changes must keep the `search_text` field and FTS index rebuild path in
+sync. Changes to recall relations should cover both default and explicit history
+views.
+
 Before submitting:
 
 ```bash
@@ -31,6 +36,7 @@ Never commit:
 
 - `memory.db`, `*.db`, SQLite WAL/SHM files, or backups
 - `projects.json` or another private alias configuration
+- `synonyms.json` when it contains private terminology
 - Obsidian exports, maintenance records, logs, or screenshots containing real text
 - credentials, private paths, account details, or installed-host source
 

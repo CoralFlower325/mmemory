@@ -33,7 +33,10 @@ class LifecycleOptimization(unittest.TestCase):
         path = Path(self.directory.name) / 'legacy.db'
         body = engine.SCHEMA_PATH.read_text().split('CREATE TABLE IF NOT EXISTS memories (', 1)[1].split('\n);', 1)[0]
         lines = [line for line in body.splitlines()
-                 if not line.strip().startswith(('protected ', 'protection_reason ', '--'))]
+                 if not line.strip().startswith((
+                     'protected ', 'protection_reason ', 'revision ', 'kind ',
+                     'source_ref ', 'origin ', 'verification ', 'valid_from ',
+                     'valid_until ', 'search_text ', '--'))]
         body = '\n'.join(lines).rstrip().rstrip(',')
         with sqlite3.connect(path) as legacy:
             legacy.execute('CREATE TABLE memories (' + body + ')')
@@ -64,7 +67,7 @@ class LifecycleOptimization(unittest.TestCase):
         self.assertEqual(result['memory_ids'], ids)
         for old, current in zip(before, self.rows()):
             for field in old:
-                if field not in ('protected', 'protection_reason'):
+                if field not in ('protected', 'protection_reason', 'revision'):
                     self.assertEqual(old[field], current[field], field)
             self.assertEqual(current['protected'], 1)
             self.assertEqual(current['protection_reason'], '明确的长期偏好')

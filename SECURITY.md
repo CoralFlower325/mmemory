@@ -7,11 +7,16 @@ service, account system, or multi-user isolation boundary.
 
 - Keep `memory.db`, WAL/SHM files, backups, exports, and `projects.json` private.
 - Recall and export can reveal paths, names, account details, and project context.
+- Source and verification fields are evidence supplied by the caller; they do not
+  prove that text is trustworthy or safe to execute.
 - Review logs, terminal output, and screenshots before sharing them.
 - Run tests against temporary synthetic databases, never a production memory file.
 
 The repository ignores common runtime data, but `.gitignore` is not a substitute
 for checking staged changes before publishing.
+
+`purge` removes a record, its relations, and revision snapshots irreversibly.
+Backups and exports must be handled separately.
 
 ## Reporting
 

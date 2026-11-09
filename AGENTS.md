@@ -2,7 +2,7 @@
 
 - 项目是 SQLite + FTS5 的本地五字段记忆系统；Python 3.10+，唯一第三方依赖是 `jieba==0.42.1`。
 - 日常入口使用 `.venv/bin/python cli.py`，测试使用 `.venv/bin/python run_tests.py`。
-- 核心模块是 `engine.py`、`tagger.py`、`filter.py`、`dream.py`、`review.py`，数据结构见 `schema.sql`。
+- 核心模块是 `engine.py`、`tagger.py`、`filter.py`、`dream.py`、`review.py`，数据结构见 `schema.sql`；当前 schema 版本为 2。
 
 ## 数据与测试
 
@@ -10,6 +10,8 @@
 - `MMEMORY_DB` 指向其他数据库；测试运行器会为每个子进程设置临时路径。
 - 新行为使用硬断言和非零失败退出码，不以打印观察值代替断言。
 - schema 变更必须先兼容现有数据库，并保持旧库追加列顺序。
+- schema v2 增加 `kind/source_ref/origin/verification/valid_from/valid_until/search_text` 与 `memory_revisions`；迁移必须在 `BEGIN IMMEDIATE` 内完成。
+- 中文 FTS 使用 `search_text` 预分词列；外部改写后使用 `reindex`，不要直接依赖旧 FTS 列。
 
 ## 核心边界
 
@@ -19,8 +21,10 @@
 - 可选字段相似只提示，不自动删除；普通 recall 不强化。
 - 召回忽略泛词，标签只排序；候选必须正文真实命中，短 ASCII 按词边界，题号与混合标识保留。
 - 自动注入只显示目标、结果和一条教训，包装后总预算 1200 字符。
+- `supersedes` 目标默认不进入现役召回；需要历史线索时使用 `--include-superseded` 或 `--deep`，并保留标注。
 - 人工 store、update、自动经验统一限制五字段合计 1000 字符；自动 experience 必须有成功关键或含处理信号的踩坑解法。
 - 修订使用 `update ID`；一条记忆围绕一种持久事实，细节指向项目文档。
+- update、归档、恢复和保护变更必须保留有界修订快照；`purge` 是不可恢复的正文与关系删除。
 - review 只读列出线索，不做语义裁决；关系和来源使用原 ID 与理由追溯。
 
 ## 维护约定
