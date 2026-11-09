@@ -671,6 +671,23 @@ def _store_locked(conn, own_conn, goal, approach, outcome,
                 warnings.append(f'记忆 #{replaced_id} 已受保护，旧版本保持活跃；新记录独立保存')
                 replaced_id = None
 
+        # 核实等级是替换的下限：低核实等级的新记录不能凭完成态话术把高
+        # 核实等级的旧里程碑自动归档顶掉（否则一条 unverified 的投毒
+        # 记录就能让 verified 的现行结论退出召回）。与保护同理，旧版本
+        # 保持活跃、新记录独立保存，并留下可见警告。
+        if replaced_id is not None and _has_column(conn, 'memories', 'verification'):
+            tier = {'disputed': 0, 'unverified': 1, 'verified': 2}
+            old_row = conn.execute('SELECT verification FROM memories WHERE id=?',
+                                   (replaced_id,)).fetchone()
+            old_tier = tier.get((old_row['verification'] or 'unverified'), 1)
+            new_tier = tier.get(metadata['verification'], 1)
+            if new_tier < old_tier:
+                warnings.append(
+                    f'记忆 #{replaced_id} 核实等级更高'
+                    f'（{old_row["verification"] or "unverified"}），'
+                    f'低核实等级新记录不自动取代；新记录独立保存')
+                replaced_id = None
+
         # 去重检查（排除即将被替换的行）
         dup_id = check_duplicate(conn, tags, goal, project_key=project_key,
                                  exclude_id=replaced_id)
@@ -877,10 +894,23 @@ def update_memory(memory_id: int, *, goal: Optional[str] = None,
             sp_open = False
             if own_tx:
                 conn.commit()
-            return {'updated': True,
-                    'reason': '正文、标签与元数据已更新，使用记录保持原值',
-                    'memory_id': memory_id,
-                    'related_ids': _related_memory_ids(conn, memory_id)}
+            result = {'updated': True,
+                      'reason': '正文、标签与元数据已更新，使用记录保持原值',
+                      'memory_id': memory_id,
+                      'related_ids': _related_memory_ids(conn, memory_id)}
+            # 核实等级只能自报、无外部证明：update 把它调高时必须留下
+            # 可见警告（修订快照里也有旧值可查），避免静默拔高把一条
+            # 未核实记录洗成 verified 后在召回里冒充可信结论。
+            tier = {'disputed': 0, 'unverified': 1, 'verified': 2}
+            old_tier = tier.get(row['verification'] or 'unverified', 1) \
+                if 'verification' in row.keys() else 1
+            new_tier = tier.get(metadata['verification'], 1)
+            if new_tier > old_tier:
+                result['warnings'] = [
+                    f'核实等级由 {row["verification"] or "unverified"} '
+                    f'自报调高为 {metadata["verification"]}，无外部证明，'
+                    f'请结合来源人工核实']
+            return result
         except Exception:
             if sp_open:
                 conn.execute('ROLLBACK TO mm_update')
@@ -956,8 +986,16 @@ def _transition_memories(memory_ids, target, reason, *, project_key, db_conn):
                     revision=COALESCE(revision,1)+1 WHERE id=?""",
                                  [(reason, mid) for mid in ids])
             else:
-                conn.executemany("""UPDATE memories SET status='active', archived_at=NULL,
+                # 恢复必须把权重抬回活跃阈值之上：衰减归档的记录权重已落
+                # 到阈值下，只改状态不抬权重时，下一次 decay 哪怕闲置 0 天
+                # 也会立刻以「低于活跃阈值」把它重新归档，restore 等于假
+                # 恢复。抬到阈值上方留一点余量，之后按正常速率再衰减。
+                floor = DELETE_THRESHOLD + 0.05
+                conn.executemany(f"""UPDATE memories SET status='active', archived_at=NULL,
                     archive_reason='', decay_cursor_at=datetime('now','localtime'),
+                    weight = CASE WHEN typeof(weight) IN ('integer','real')
+                                  AND weight >= {floor} THEN weight
+                                  ELSE {floor} END,
                     revision=COALESCE(revision,1)+1 WHERE id=?""",
                                  [(mid,) for mid in ids])
             conn.execute('RELEASE mm_transition')
@@ -1260,6 +1298,22 @@ def purge_memory(memory_id: int, reason: str, *,
                 return {**result, 'reason': 'ID 不存在或项目不符'}
             conn.execute('SAVEPOINT mm_purge')
             sp_open = True
+            # 被删者若是 supersedes 的后继，关系行一并删除后前任会静默
+            # 恢复默认召回——先在前任身上留一条修订快照说明它为何回来，
+            # 并在结果里点名，操作者删之前（dry 结果）与删之后都看得见。
+            resurrected_ids = []
+            if _has_column(conn, 'memory_relations', 'source_id'):
+                predecessor_rows = conn.execute(
+                    """SELECT target.* FROM memory_relations r
+                       JOIN memories target ON target.id = r.target_id
+                       WHERE r.source_id = ? AND r.relation = 'supersedes'""",
+                    (memory_id,)).fetchall()
+                for predecessor in predecessor_rows:
+                    resurrected_ids.append(predecessor['id'])
+                    _record_revision(
+                        conn, dict(predecessor),
+                        f'后继记忆 #{memory_id} 已被硬删除（{reason}），'
+                        f'本记录恢复默认召回')
             conn.execute(
                 'DELETE FROM memory_relations WHERE source_id=? OR target_id=?',
                 (memory_id, memory_id))
@@ -1278,7 +1332,7 @@ def purge_memory(memory_id: int, reason: str, *,
                     conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
                 except sqlite3.Error as exc:
                     cleanup_error = str(exc)
-            return {**result, 'purged': True,
+            purge_result = {**result, 'purged': True,
                     'physical_cleanup': bool(own_conn) and not cleanup_error,
                     'reason': (
                         '记忆正文、关系与修订快照已删除并压缩数据库'
@@ -1286,6 +1340,12 @@ def purge_memory(memory_id: int, reason: str, *,
                         f'记忆已逻辑删除，但物理压缩失败：{cleanup_error}'
                         if own_conn else
                         '记忆已逻辑删除；调用方事务提交后需自行 VACUUM')}
+            if resurrected_ids:
+                purge_result['resurrected_ids'] = resurrected_ids
+                purge_result['warnings'] = [
+                    f'被取代的前任记忆 {resurrected_ids} 已随本次删除'
+                    f'恢复默认召回（其修订史已标注原因）']
+            return purge_result
         except Exception:
             if sp_open:
                 conn.execute('ROLLBACK TO mm_purge')
@@ -1464,9 +1524,15 @@ def _recall_locked(conn, own_conn, message, limit, reinforce, project_key,
                 if source != 'tag':
                     text_rank[mid] = min(text_rank.get(mid, candidate_limit), rank)
         required_hits, hits, matched_chars = {}, {}, {}
+        gate_hit = {}
         required_groups = [_term_group(term) for term in required_terms]
+        gate_groups = [_gate_group(term) for term in required_terms]
         identity_groups = [
             group for group in required_groups
+            if any(_is_identity_term(term) for term in group)
+        ]
+        gate_identity_groups = [
+            group for group in gate_groups
             if any(_is_identity_term(term) for term in group)
         ]
         for mid, row in candidates.items():
@@ -1476,6 +1542,9 @@ def _recall_locked(conn, own_conn, message, limit, reinforce, project_key,
                 ('goal', 'outcome', 'success_key')))
             group_hits = [_term_group_in_text(group, body)
                           for group in required_groups]
+            # 过门判定用收紧后的 gate 组（超大等价组只认原词），排序仍用全组。
+            gate_hit[mid] = any(
+                _term_group_in_text(group, body) for group in gate_groups)
             goal_text = _strip_contrastive_identifiers(row.get('goal'))
             identity_hits = [
                 _identity_group_in_text(group, goal_text) * 2
@@ -1487,6 +1556,7 @@ def _recall_locked(conn, own_conn, message, limit, reinforce, project_key,
             matched_chars[mid] = sum(len(term) for term in ranking_terms
                                      if _term_in_text(term, body))
         superseded_by = {}
+        successor_inactive = {}
         if _has_column(conn, 'memory_relations', 'source_id'):
             relation_rows = conn.execute("""
                 SELECT r.target_id, r.source_id,
@@ -1508,11 +1578,19 @@ def _recall_locked(conn, own_conn, message, limit, reinforce, project_key,
                     'valid_from': row['source_valid_from'],
                     'valid_until': row['source_valid_until'],
                 })
-                if row['source_status'] == 'active' and source_validity:
-                    continue
-                if row['source_status'] not in ('active', 'archived'):
-                    continue
-                superseded_by[row['target_id']] = row['source_id']
+                # 取代只在后继现役（active 且当前有效）时成立。后继过期或
+                # 被归档后，前任恢复默认召回但必须带标注——旧行为三者互不
+                # 一致：过期时前任无标注复活、归档时新旧双双消失成事实
+                # 真空。现在统一为「后继不现役 ⇒ 前任带 successor-* 标注
+                # 回到召回」，读者能看出这条结论的后继已不在现役。
+                if row['source_status'] == 'active' and not source_validity:
+                    superseded_by[row['target_id']] = row['source_id']
+                elif row['source_status'] == 'active':
+                    successor_inactive[row['target_id']] = (
+                        row['source_id'], source_validity)
+                elif row['source_status'] == 'archived':
+                    successor_inactive[row['target_id']] = (
+                        row['source_id'], 'archived')
 
         def order(row):
             mid = row['id']
@@ -1525,20 +1603,23 @@ def _recall_locked(conn, own_conn, message, limit, reinforce, project_key,
         # 标签、动作词和宽泛词只能提升排序。两个以上非泛词时，至少命中两个，
         # 避免查询“Go 路由”只因共享“路由”而拉入 Django 记录。
         short_groups = [
-            group for group in required_groups
+            group for group in gate_groups
             if any(term.isascii() and len(term) <= 3 for term in group)
         ]
-        mandatory_groups = list(dict.fromkeys((*short_groups, *identity_groups)))
+        mandatory_groups = list(
+            dict.fromkeys((*short_groups, *gate_identity_groups)))
         relevant = []
         for row in candidates.values():
             body = ' '.join(str(row.get(field) or '') for field in CONTENT_FIELDS)
             if required_hits[row['id']] < 1:
                 continue
+            if required_terms and not gate_hit[row['id']]:
+                continue
             # 短标识（如 Go、API、401）必须全部命中，避免共享中文词把
             # Django/Google 或相邻版本带进来；长词仍可单独召回。
             if any(
                     not (_identity_group_in_text(group, body)
-                         if group in identity_groups
+                         if group in gate_identity_groups
                          else _term_group_in_text(group, body))
                     for group in mandatory_groups):
                 continue
@@ -1551,6 +1632,11 @@ def _recall_locked(conn, own_conn, message, limit, reinforce, project_key,
             enriched = dict(row)
             if row['id'] in superseded_by:
                 enriched['_superseded_by'] = superseded_by[row['id']]
+            if (row['id'] in successor_inactive
+                    and row['id'] not in superseded_by):
+                inactive_id, inactive_state = successor_inactive[row['id']]
+                enriched['_successor_inactive'] = inactive_id
+                enriched['_successor_state'] = inactive_state
             if state == 'expired':
                 enriched['_expired'] = True
             elif state == 'future':
@@ -1802,12 +1888,39 @@ def _search_terms(query: str) -> list[str]:
                 if part.casefold() not in seen:
                     seen.add(part.casefold())
                     terms.append(part)
+    # 候选词必须封顶：LIKE 路径按词拼 SQL 表达式，数百个不同词会让
+    # SQLite 抛 Expression tree is too large，粘贴一段日志/堆栈做查询时
+    # 整条召回链路直接崩。超限时优先保留更长的具体词，泛词先丢。
+    if len(terms) > 100:
+        keep = set(sorted(terms, key=lambda t: -len(t))[:100])
+        terms = [term for term in terms if term in keep]
     return terms
 
 
 def _term_group(term: str) -> tuple[str, ...]:
     values = [term, *search_term_equivalents(term)]
+    # 带预发布后缀的版本号（v2.6.1-beta）把基础版本一并入组：查后缀版应能
+    # 命中只写了基础版本的记录，反之亦然（后缀在 _term_in_text 里按同一
+    # 版本的边界处理）。不同基础版本之间仍严格区分，不会重演 v2/v3 串扰。
+    version = re.fullmatch(
+        r'(?i)(v?\d+(?:\.\d+)+)-[a-z0-9][a-z0-9.-]*', term or '')
+    if version:
+        values.append(version.group(1))
     return tuple(dict.fromkeys(value for value in values if value))
+
+
+# 等价组过大时等价词不再能单独满足召回门：用户自定义同义词组若把查询词
+# 与高频泛词绑成一组（如 宕机=系统/数据/服务/请求/用户/处理/完成），等价
+# 命中会把无关记录整批放行、判别力被稀释殆尽。超限时只认原词命中，
+# 等价词仍可参与候选生成与排序。
+_MAX_GATE_EQUIVALENTS = 6
+
+
+def _gate_group(term: str) -> tuple[str, ...]:
+    group = _term_group(term)
+    if len(group) - 1 > _MAX_GATE_EQUIVALENTS:
+        return (term,)
+    return group
 
 
 def _term_group_in_text(group: tuple[str, ...], text: str) -> bool:
@@ -1842,7 +1955,24 @@ def _term_in_text(term: str, text: str) -> bool:
                 rf'{re.escape(reverse.group(2))}(?![a-z0-9_-])',
                 folded_text):
             return True
-        boundary_word = 'a-z0-9-' if '_' in folded_term else 'a-z0-9_-'
+        # 版本号：同一基础版本的预发布后缀（-beta/-rc1 等）算同一版本，
+        # 允许后缀被整体越过；但后续若是数字/点（如 v2.6.12、v2.6.1.5）
+        # 仍是另一个版本，必须挡住。旧实现把 '-' 一律当标识内部字符，
+        # 结果存了 v2.6.1-beta 的记录按原文查 v2.6.1-beta 都零召回。
+        if re.fullmatch(r'v?\d+(?:\.\d+)+', folded_term):
+            return re.search(
+                rf'(?<![a-z0-9_-]){re.escape(folded_term)}'
+                rf'(?:-[a-z0-9][a-z0-9.-]*)?(?![a-z0-9_.-])',
+                folded_text) is not None
+        # '_' 对普通英文词（≥4 个字母）是分段符：user_slot_acquire_failed
+        # 的 acquire/slot/failed 等中段应可搜，旧实现把 '_' 一律列入阻断
+        # 类让这类词永远命不中。但短词与标识型词（go、bps、node.js）必须
+        # 继续把 '_' 当阻断：go≠go_lang、BPS≠BPS_401 是不同的标识，
+        # 仓库测试已把这条判别钉死，故只给普通长词开分段口子。
+        if re.fullmatch(r'[a-z]{4,}', folded_term):
+            boundary_word = 'a-z0-9-'
+        else:
+            boundary_word = 'a-z0-9-' if '_' in folded_term else 'a-z0-9_-'
         pattern = (
             rf'(?<![{boundary_word}]){re.escape(folded_term)}'
             rf'(?![{boundary_word}])'
@@ -2330,13 +2460,26 @@ def format_recall_context(m: dict, index: int = 0) -> str:
     flags = []
     if m.get('kind') and m.get('kind') != 'experience':
         flags.append(_clean_display(m.get('kind')))
+    # 核实状态一律显示，包括 verified：旧实现只给非 verified 打标记，
+    # 等于默认「没标记的就是可信的」，而 verified 同样只是写入者自报、
+    # 无任何外部证明——自称 verified 的记录反而显得最干净。来源只显示
+    # origin（渠道标签，如 untrusted-web）：块头要求读者「结合来源
+    # 核实」，渠道是核实所需信息；而 source_ref 可能是私人文件路径，
+    # 仓库既有测试明确禁止它进入注入块，故不显示。两者都压在首行
+    # flags 内，不增加条目行数。
     verification = _clean_display(m.get('verification') or 'unverified')
-    if verification != 'verified':
-        flags.append(verification)
+    flags.append(verification)
+    source = _clean_display(m.get('origin') or '')
+    if source:
+        flags.append(f'src:{_clip_text(source, 40)}')
     if m.get('status') == 'archived':
         flags.append('archived')
     if m.get('_superseded_by'):
         flags.append(f"superseded-by:#{m['_superseded_by']}")
+    if m.get('_successor_inactive'):
+        flags.append(
+            f"successor-{m.get('_successor_state') or 'inactive'}"
+            f":#{m['_successor_inactive']}")
     if m.get('_expired'):
         flags.append('expired')
     if m.get('_not_yet_valid'):

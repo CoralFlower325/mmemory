@@ -129,10 +129,26 @@ Use `--explain` to inspect the resolved project, required terms, source of each
 hit, and ordering reason. The default injected summary contains the goal,
 outcome, and one lesson, with wrapper text included in a 1200-character budget.
 
-Relations affect recall: a target of a `supersedes` relation is hidden by
-default. `--include-superseded` restores it with a label. `--deep` considers
-archived records after current hits, and `--include-expired` shows records outside
-their validity window. Memory text is presented as data, not as instructions.
+Relations affect recall: a target of a `supersedes` relation is hidden while
+its successor is active and currently valid. `--include-superseded` restores it
+with a label. If the successor has expired or been archived, the predecessor
+returns to default recall with a `successor-expired`/`successor-archived`
+label instead of silently resurfacing or leaving a gap; purging a successor
+leaves a revision note on the predecessor and reports it as resurrected.
+`--deep` considers archived records after current hits, and
+`--include-expired` shows records outside their validity window. Memory text
+is presented as data, not as instructions.
+
+Identifier matching is version- and segment-aware: a stored `v2.6.1-beta`
+record is found by both `v2.6.1-beta` and `v2.6.1` (but not by a different
+version such as `v2.6.12`), and the segments of a `snake_case` identifier
+(`acquire` in `user_slot_acquire_failed`) are searchable, while short
+identifiers still discriminate strictly (`go` does not match `go_lang`).
+Term equivalents are symmetric and transitive, so an alias defined in one
+direction works in both. An oversized custom synonym group (more than six
+equivalents for one term) can no longer satisfy the recall gate by itself;
+only the original term can. Candidate terms are capped, so pasting a long
+log or stack trace as a query degrades gracefully instead of failing.
 
 Ordinary recall does not change use counts or weights. Add `--reinforce` only
 after the memory was actually used. If a new result changes a known fact, use
@@ -162,6 +178,16 @@ Memory type, provenance, verification, and validity are persisted:
 snapshots in `memory_revisions`; the default limit is 20 retained revisions per
 memory and can be changed with `MMEMORY_REVISION_LIMIT`. Preferences decay more
 slowly than experiences and project facts.
+
+Verification is self-reported and never silently trusted: the injected
+summary always shows the verification state (including `verified`) plus the
+`origin` channel when present, so a reader can weigh provenance; `source_ref`
+is never shown in injected summaries because it may be a private path.
+`update` reports a warning when it raises a record's verification level.
+Milestone replacement respects verification as a floor: a lower-verification
+record cannot automatically archive a higher-verification milestone.
+Restoring an archived memory lifts its weight back above the decay
+threshold, so the next decay pass does not immediately re-archive it.
 
 ## CLI
 
